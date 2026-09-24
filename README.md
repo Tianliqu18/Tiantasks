@@ -21,7 +21,7 @@ tt add "Write docs" -p high -t docs
 tt issue "Login broken" -p crit -d "repro steps" --to claude-tianli
 tt resolve I-3 -m "fixed in auth.py"
 tt comment I-3 -r 12 "reply to comment c12"
-tt ui                   # open the web board (Add form, screenshots, comment threads, light/dark)
+tt ui                   # open the web board: Queues and Board tabs, click a ticket for its full view
 tt board                # terminal kanban: OPEN → IN PROGRESS → DONE (press ? for keys)
 tt help                 # every command
 ```

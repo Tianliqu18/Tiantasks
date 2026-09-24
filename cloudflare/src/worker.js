@@ -7,6 +7,13 @@ import LOGIN_PAGE from "./login.html";
 import CLI from "./tiantasks.txt";
 import BOARD_APP from "./board.mjs.txt";
 
+// Open pages compare this to what they loaded with and reload onto a new release.
+const PAGE_BUILD = (() => {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < PAGE.length; i++) h = Math.imul(h ^ PAGE.charCodeAt(i), 0x01000193);
+  return (h >>> 0).toString(16);
+})();
+
 const VERSION = "2.6.0";
 const PRIORITIES = ["crit", "high", "med", "low"];
 const PRANK = Object.fromEntries(PRIORITIES.map((p, i) => [p, i]));
@@ -462,7 +469,7 @@ async function handle(request, env) {
   if (mf && method === "DELETE") return json(await store.deleteAttachment(Number(mf[1]), actor));
 
   if (method === "GET" && path === "/") return html(PAGE);
-  if (method === "GET" && path === "/api/version") return json({ v: await store.version() });
+  if (method === "GET" && path === "/api/version") return json({ v: await store.version(), build: PAGE_BUILD });
   if (method === "GET" && path === "/api/me") return json({ user, actor, shared: true, admin: isAdmin });
   if (method === "GET" && path === "/api/state") {
     const project = q.get("project") || undefined;
