@@ -7,7 +7,7 @@ import LOGIN_PAGE from "./login.html";
 import CLI from "./tiantasks.txt";
 import AGENT_GUIDE from "./llms.txt";
 
-const VERSION = "2.3.0";
+const VERSION = "2.3.1";
 const PRIORITIES = ["crit", "high", "med", "low"];
 const PRANK = Object.fromEntries(PRIORITIES.map((p, i) => [p, i]));
 const STATUSES = ["open", "doing", "done"];
@@ -70,6 +70,13 @@ function fromBase64(s) {
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
 }
+
+// Open pages compare this to what they loaded with and reload onto a new release.
+const PAGE_BUILD = (() => {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < PAGE.length; i++) h = Math.imul(h ^ PAGE.charCodeAt(i), 0x01000193);
+  return (h >>> 0).toString(16);
+})();
 
 // ------------------------------------------------------------------ store
 
@@ -377,7 +384,7 @@ async function handle(request, env) {
   const att = path.match(/^\/api\/attachments\/(\d+)$/);
 
   if (method === "GET" && path === "/") return html(PAGE);
-  if (method === "GET" && path === "/api/version") return json({ v: await store.version() });
+  if (method === "GET" && path === "/api/version") return json({ v: await store.version(), build: PAGE_BUILD });
   if (method === "GET" && path === "/api/me") return json({ user, actor, shared: true });
   if (method === "GET" && path === "/api/state") {
     const project = q.get("project") || undefined;

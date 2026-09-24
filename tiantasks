@@ -11,6 +11,7 @@ import argparse
 import base64
 import datetime as dt
 import getpass
+import hashlib
 import hmac
 import json
 import mimetypes
@@ -31,7 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
-VERSION = "2.3.0"
+VERSION = "2.3.1"
 DEFAULT_DB = Path.home() / ".tiantasks" / "tiantasks.db"
 CONFIG = Path.home() / ".tiantasks" / "config.json"
 DEFAULT_PORT = int(os.environ.get("TIANTASKS_PORT", 7777))
@@ -852,7 +853,7 @@ def make_handler(db_path, me, users=None):
             if method == "GET" and path == "/":
                 return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
             if method == "GET" and path == "/api/version":
-                return self._send(200, {"v": store.version()})
+                return self._send(200, {"v": store.version(), "build": PAGE_BUILD})
             if method == "GET" and path == "/api/me":
                 return self._send(200, {"user": user, "actor": actor, "shared": users is not None})
             if method == "GET" and path == "/api/state":
@@ -1812,7 +1813,7 @@ function md(src) {
 }
 
 // ---------------------------------------------------------------- state
-let S = null, lastText = '', kind = 'task', lastVersion = null;
+let S = null, lastText = '', kind = 'task', lastVersion = null, pageBuild = null;
 let view = saved.get('view', 'queues'), qtab = saved.get('qtab', 'active'), kindF = saved.get('kind', 'all');
 let project = saved.get('project', ''), who = saved.get('who', ''), query = '';
 let dragId = null, addCol = null, doneLimit = 40;
@@ -1854,8 +1855,11 @@ async function tick() {
   try {
     const r = await fetch('/api/version');
     if (r.status === 401) { location.reload(); return; }
-    const {v} = await r.json();
+    const {v, build} = await r.json();
     $('#dot').classList.remove('off');
+    // A new release was deployed: reload onto it, but never out from under an open ticket or a drag.
+    if (build && pageBuild && build !== pageBuild && !M) { location.reload(); return; }
+    pageBuild = pageBuild || build;
     if (v !== lastVersion) { lastVersion = v; await refresh(true); if (M) loadModal(); }
   } catch { $('#dot').classList.add('off'); }
 }
@@ -2527,6 +2531,8 @@ document.addEventListener('visibilitychange', tick);
 </body>
 </html>
 """
+
+PAGE_BUILD = hashlib.sha1(PAGE.encode()).hexdigest()[:12]  # open pages reload when this changes
 
 
 LOGIN_PAGE = r"""<!doctype html>
