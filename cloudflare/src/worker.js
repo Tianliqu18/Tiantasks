@@ -5,23 +5,19 @@
 import PAGE from "./page.html";
 import LOGIN_PAGE from "./login.html";
 import CLI from "./tiantasks.txt";
-import AGENT_GUIDE from "./llms.txt";
+import BOARD_APP from "./board.mjs.txt";
 
-const VERSION = "2.3.1";
+const VERSION = "2.6.0";
 const PRIORITIES = ["crit", "high", "med", "low"];
 const PRANK = Object.fromEntries(PRIORITIES.map((p, i) => [p, i]));
 const STATUSES = ["open", "doing", "done"];
-const PATCHABLE = ["status", "note", "assignee", "priority", "title", "body", "tags", "project"];
-const MAX_ATTACHMENT = 1_500_000; // a D1 row tops out at 2MB; the page shrinks screenshots to fit
-const INLINE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
-
-// Items come back with counts the board shows on cards: files, the first image (cover), comments.
-const ITEM_SELECT = `SELECT items.*,
-  (SELECT COUNT(*) FROM attachments a WHERE a.item_id = items.id) AS files,
-  (SELECT MIN(a.id) FROM attachments a WHERE a.item_id = items.id AND a.mime LIKE 'image/%') AS cover,
-  (SELECT COUNT(*) FROM events e WHERE e.item_id = items.id AND e.action = 'commented') AS comments
-FROM items`;
-const ATT_COLS = "id, item_id, name, mime, size, created_by, created_at";
+const IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+const MAX_ATTACHMENT = 1_900_000; // D1 rows top out at 2 MB; the page shrinks screenshots to fit
+const humanSize = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1000))} KB`);
+const cleanFilename = (name) =>
+  (String(name || "").split(/[\\/]/).pop().replace(/[^\w.\- ]+/g, "_").replace(/^[ ._]+|[ ._]+$/g, "").slice(0, 100)) || "screenshot";
+const PATCHABLE = ["status", "note", "assignee", "priority", "title", "body", "tags", "project", "if_status", "if_assignee"];
+const AGENT_NAME = /^[a-z0-9][a-z0-9_.-]{0,39}$/;
 
 class TTError extends Error {
   constructor(message, status = 400) {
@@ -56,27 +52,6 @@ const byQueue = (a, b) =>
   (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0);
 
 const toItem = (r) => ({ ...r, tags: JSON.parse(r.tags), ref: `${r.kind === "task" ? "T" : "I"}-${r.num}` });
-const toAtt = (r) => ({ id: r.id, item_id: r.item_id, name: r.name, mime: r.mime, size: r.size,
-  created_by: r.created_by, created_at: r.created_at, url: `/api/attachments/${r.id}` });
-
-function fromBase64(s) {
-  let bin;
-  try {
-    bin = atob(String(s || ""));
-  } catch {
-    throw new TTError("attachment data must be base64");
-  }
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
-
-// Open pages compare this to what they loaded with and reload onto a new release.
-const PAGE_BUILD = (() => {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < PAGE.length; i++) h = Math.imul(h ^ PAGE.charCodeAt(i), 0x01000193);
-  return (h >>> 0).toString(16);
-})();
 
 // ------------------------------------------------------------------ store
 
@@ -88,10 +63,57 @@ class Store {
   async get(ref) {
     const [kind, num] = parseRef(ref);
     const r = kind === null
-      ? await this.db.prepare(`${ITEM_SELECT} WHERE items.id = ?`).bind(num).first()
-      : await this.db.prepare(`${ITEM_SELECT} WHERE kind = ? AND num = ?`).bind(kind, num).first();
+      ? await this.db.prepare("SELECT * FROM items WHERE id = ?").bind(num).first()
+      : await this.db.prepare("SELECT * FROM items WHERE kind = ? AND num = ?").bind(kind, num).first();
     if (!r) throw new TTError(`no item ${ref}`, 404);
-    return toItem(r);
+    const item = toItem(r);
+    item.attachments = (await this.attachmentMeta(item.id)).get(item.id) || [];
+    return item;
+  }
+
+  async attachmentMeta(itemId) {
+    const q = "SELECT id, item_id, name, mime, size FROM attachments" + (itemId ? " WHERE item_id = ?" : "") + " ORDER BY id";
+    const stmt = itemId ? this.db.prepare(q).bind(itemId) : this.db.prepare(q);
+    const meta = new Map();
+    for (const a of (await stmt.all()).results) {
+      if (!meta.has(a.item_id)) meta.set(a.item_id, []);
+      meta.get(a.item_id).push({ id: a.id, name: a.name, mime: a.mime, size: a.size });
+    }
+    return meta;
+  }
+
+  async attach(ref, actor, name, mime, data) {
+    if (!IMAGE_TYPES.includes(mime)) throw new TTError("only PNG, JPEG, WebP or GIF images can be attached", 415);
+    if (!data.byteLength) throw new TTError("the image is empty");
+    if (data.byteLength > MAX_ATTACHMENT) {
+      throw new TTError(`the image is ${humanSize(data.byteLength)}; the limit is ${humanSize(MAX_ATTACHMENT)}`, 413);
+    }
+    const it = await this.get(ref);
+    name = cleanFilename(name);
+    const [ins] = await this.db.batch([
+      this.db.prepare(
+        "INSERT INTO attachments (item_id, name, mime, size, data, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+      ).bind(it.id, name, mime, data.byteLength, data, actor, now()),
+      this.log(it, actor, "attached", name),
+    ]);
+    return { id: ins.results[0].id, name, mime, size: data.byteLength };
+  }
+
+  async attachment(id) {
+    const a = await this.db.prepare("SELECT * FROM attachments WHERE id = ?").bind(id).first();
+    if (!a) throw new TTError("no such attachment", 404);
+    return a;
+  }
+
+  async deleteAttachment(id, actor) {
+    const a = await this.db.prepare("SELECT id, item_id, name FROM attachments WHERE id = ?").bind(id).first();
+    if (!a) throw new TTError("no such attachment", 404);
+    const it = await this.get(a.item_id);
+    await this.db.batch([
+      this.db.prepare("DELETE FROM attachments WHERE id = ?").bind(id),
+      this.log(it, actor, "removed screenshot", a.name),
+    ]);
+    return { ok: true };
   }
 
   log(item, actor, action, detail = "") {
@@ -111,22 +133,36 @@ class Store {
     // One batch = one transaction, so two people adding at once can't get the same number.
     const [inserted] = await this.db.batch([
       this.db.prepare(
+        // Deleted items live on in events, so counting them too means a number is never reused.
         `INSERT INTO items (kind, num, project, title, body, priority, tags, assignee, created_by, created_at, updated_at)
-         SELECT ?1, COALESCE(MAX(num), 0) + 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9 FROM items WHERE kind = ?1
+         VALUES (?1, (SELECT COALESCE(MAX(n), 0) + 1 FROM (
+                        SELECT MAX(num) AS n FROM items WHERE kind = ?1
+                        UNION ALL
+                        SELECT MAX(CAST(substr(ref, 3) AS INTEGER)) FROM events WHERE substr(ref, 1, 1) = ?10)),
+                 ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
          RETURNING *`,
       ).bind(kind, squash(b.project) || "general", title, b.body || "", b.priority || "",
-        JSON.stringify(cleanTags(b.tags)), assignee, actor, t),
+        JSON.stringify(cleanTags(b.tags)), assignee, actor, t, kind === "task" ? "T" : "I"),
       this.db.prepare(
         `INSERT INTO events (item_id, ref, title, project, at, actor, action, detail)
          SELECT id, CASE kind WHEN 'task' THEN 'T-' ELSE 'I-' END || num, title, project, ?1, ?2, 'opened', ?3
          FROM items WHERE id = (SELECT MAX(id) FROM items)`,
       ).bind(t, actor, assignee ? `for ${assignee}` : ""),
     ]);
-    return this.get(inserted.results[0].id);
+    return toItem(inserted.results[0]);
   }
 
   async update(ref, actor, ch) {
+    const { if_status: ifStatus, if_assignee: ifAssignee, ...rest } = ch;
+    ch = rest;
     const it = await this.get(ref);
+    // Optional guards so two agents can't claim the same item.
+    if (ifStatus != null && it.status !== ifStatus) {
+      throw new TTError(`${it.ref} is already ${it.status}${it.assignee ? ` (${it.assignee})` : ""}`, 409);
+    }
+    if (ifAssignee != null && it.assignee !== ifAssignee) {
+      throw new TTError(`${it.ref} was just assigned to ${it.assignee || "nobody"}`, 409);
+    }
     const sets = {};
     const events = [];
     let note = ch.note ?? null;
@@ -181,18 +217,63 @@ class Store {
     sets.updated_at = now();
     const cols = Object.keys(sets).map((k) => `${k} = ?`).join(", ");
     const after = { ...it, ...sets };
-    await this.db.batch([
-      this.db.prepare(`UPDATE items SET ${cols} WHERE id = ?`).bind(...Object.values(sets), it.id),
-      ...events.map(([action, detail]) => this.log(after, actor, action, detail)),
-    ]);
+    const logs = events.map(([action, detail]) => this.log(after, actor, action, detail));
+    if (ifStatus != null || ifAssignee != null) {
+      // Compare-and-set: the UPDATE only applies if nobody changed the item since we read it.
+      const res = await this.db
+        .prepare(`UPDATE items SET ${cols} WHERE id = ? AND status = ? AND assignee = ?`)
+        .bind(...Object.values(sets), it.id, it.status, it.assignee).run();
+      if (!res.meta.changes) throw new TTError(`${it.ref} was just taken by someone else`, 409);
+      if (logs.length) await this.db.batch(logs);
+    } else {
+      await this.db.batch([
+        this.db.prepare(`UPDATE items SET ${cols} WHERE id = ?`).bind(...Object.values(sets), it.id),
+        ...logs,
+      ]);
+    }
     return this.get(it.id);
   }
 
-  async comment(ref, actor, text) {
-    if (!String(text || "").trim()) throw new TTError("comment cannot be empty");
+  static commentRow(r) {
+    const deleted = !!r.deleted_at;
+    return { id: r.id, parent_id: r.parent_id, author: r.author, body: deleted ? "" : r.body, at: r.created_at, deleted };
+  }
+
+  // All comments on an item, oldest first. Replies carry parent_id (threads are one level deep).
+  async comments(ref) {
     const it = await this.get(ref);
-    await this.log(it, actor, "commented", String(text).trim()).run();
-    return it;
+    const { results } = await this.db.prepare("SELECT * FROM comments WHERE ref = ? ORDER BY id").bind(it.ref).all();
+    return results.map(Store.commentRow);
+  }
+
+  async comment(ref, actor, text, parentId) {
+    text = String(text || "").trim();
+    if (!text) throw new TTError("comment cannot be empty");
+    const it = await this.get(ref);
+    if (parentId) {
+      const p = await this.db.prepare("SELECT id, parent_id FROM comments WHERE id = ? AND ref = ?").bind(Number(parentId), it.ref).first();
+      if (!p) throw new TTError(`no comment ${parentId} on ${it.ref}`, 404);
+      parentId = p.parent_id || p.id; // replying to a reply joins the same thread
+    }
+    const [ins] = await this.db.batch([
+      this.db.prepare("INSERT INTO comments (item_id, ref, parent_id, author, body, created_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING *")
+        .bind(it.id, it.ref, parentId || null, actor, text, now()),
+      this.log(it, actor, parentId ? "replied" : "added a comment", text),
+    ]);
+    return Store.commentRow(ins.results[0]);
+  }
+
+  async deleteComment(id, actor, isAdmin) {
+    if (!isAdmin) throw new TTError("only an admin can delete comments", 403);
+    const c = await this.db.prepare("SELECT * FROM comments WHERE id = ?").bind(id).first();
+    if (!c || c.deleted_at) throw new TTError(`no comment ${id}`, 404);
+    const it = await this.get(c.ref);
+    // Soft delete, so replies to it still make sense ("comment deleted" stays in the thread).
+    await this.db.batch([
+      this.db.prepare("UPDATE comments SET deleted_at = ?, deleted_by = ?, body = '' WHERE id = ?").bind(now(), actor, id),
+      this.log(it, actor, "deleted a comment", `by ${c.author}`),
+    ]);
+    return { ok: true };
   }
 
   async remove(ref, actor) {
@@ -200,72 +281,30 @@ class Store {
     await this.db.batch([
       this.db.prepare("DELETE FROM items WHERE id = ?").bind(it.id),
       this.db.prepare("DELETE FROM attachments WHERE item_id = ?").bind(it.id),
+      this.db.prepare("DELETE FROM comments WHERE ref = ?").bind(it.ref),
       this.log(it, actor, "deleted"),
     ]);
     return it;
   }
 
-  async attach(ref, actor, b) {
-    const data = fromBase64(b.data);
-    if (!data.byteLength) throw new TTError("attachment is empty");
-    if (data.byteLength > MAX_ATTACHMENT) {
-      throw new TTError(`attachment is ${Math.floor(data.byteLength / 1024)} KB; the limit is ${MAX_ATTACHMENT / 1000} KB`, 413);
-    }
-    const name = String(b.name || "").split(/[\\/]/).pop().trim().slice(0, 120) || "file";
-    const mime = /^[\w.+-]+\/[\w.+-]+$/.test(b.mime || "") ? b.mime : "application/octet-stream";
-    const it = await this.get(ref);
-    const t = now();
-    const [ins] = await this.db.batch([
-      this.db.prepare(
-        `INSERT INTO attachments (item_id, name, mime, size, data, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
-         RETURNING ${ATT_COLS}`,
-      ).bind(it.id, name, mime, data.byteLength, data, actor, t),
-      this.db.prepare("UPDATE items SET updated_at = ? WHERE id = ?").bind(t, it.id),
-    ]);
-    const att = toAtt(ins.results[0]);
-    await this.log(it, actor, "attached", `${name} (#${att.id})`).run();
-    return att;
-  }
-
-  async attachments(ref) {
-    const it = await this.get(ref);
-    const { results } = await this.db.prepare(`SELECT ${ATT_COLS} FROM attachments WHERE item_id = ? ORDER BY id`).bind(it.id).all();
-    return results.map(toAtt);
-  }
-
-  async attachment(id) {
-    const r = await this.db.prepare("SELECT * FROM attachments WHERE id = ?").bind(Number(id)).first();
-    if (!r) throw new TTError(`no attachment #${id}`, 404);
-    return r;
-  }
-
-  async detach(id, actor) {
-    const a = await this.attachment(id);
-    const it = await this.get(a.item_id);
-    await this.db.batch([
-      this.db.prepare("DELETE FROM attachments WHERE id = ?").bind(a.id),
-      this.log(it, actor, "detached", `${a.name} (#${a.id})`),
-    ]);
-    return toAtt(a);
-  }
-
   async list({ project, statuses, kind, assignee, grep } = {}) {
-    let sql = `${ITEM_SELECT} WHERE 1 = 1`;
+    let sql = "SELECT * FROM items WHERE 1 = 1";
     const args = [];
     if (project) { sql += " AND project = ?"; args.push(project); }
     if (statuses?.length) { sql += ` AND status IN (${statuses.map(() => "?").join(",")})`; args.push(...statuses); }
     if (kind) { sql += " AND kind = ?"; args.push(kind); }
     if (assignee !== undefined && assignee !== null) { sql += " AND assignee = ?"; args.push(assignee); }
     if (grep) { sql += " AND (title LIKE ? OR body LIKE ? OR note LIKE ?)"; args.push(`%${grep}%`, `%${grep}%`, `%${grep}%`); }
-    const { results } = await this.db.prepare(sql).bind(...args).all();
-    return results.map(toItem).sort(byQueue);
+    const [{ results }, meta] = await Promise.all([this.db.prepare(sql).bind(...args).all(), this.attachmentMeta()]);
+    return results.map((r) => ({ ...toItem(r), attachments: meta.get(r.id) || [] })).sort(byQueue);
   }
 
-  async events({ limit = 40, project, itemId } = {}) {
+  async events({ limit = 40, project, itemId, ref } = {}) {
     let sql = "SELECT * FROM events WHERE 1 = 1";
     const args = [];
+    if (itemId && !ref) ref = (await this.get(itemId)).ref; // history follows the never-reused T-/I- number
     if (project) { sql += " AND project = ?"; args.push(project); }
-    if (itemId) { sql += " AND item_id = ?"; args.push(itemId); }
+    if (ref) { sql += " AND ref = ?"; args.push(ref); }
     sql += " ORDER BY id DESC LIMIT ?";
     args.push(Math.min(Number(limit) || 40, 500));
     return (await this.db.prepare(sql).bind(...args).all()).results;
@@ -277,8 +316,10 @@ class Store {
   }
 
   async assignees() {
-    const q = "SELECT DISTINCT assignee FROM items WHERE assignee != '' ORDER BY assignee";
-    return (await this.db.prepare(q).all()).results.map((r) => r.assignee);
+    // Current assignees plus anyone recently active (so new agents show up in pickers).
+    const q = `SELECT assignee AS name FROM items WHERE assignee != '' UNION
+               SELECT actor FROM (SELECT actor FROM events ORDER BY id DESC LIMIT 500) ORDER BY 1`;
+    return (await this.db.prepare(q).all()).results.map((r) => r.name);
   }
 
   async version() {
@@ -350,8 +391,8 @@ async function handle(request, env) {
   const method = request.method;
 
   if (path === "/api/ping") return json({ app: "tiantasks", version: VERSION });
-  if (path === "/llms.txt") {
-    return new Response(AGENT_GUIDE, { headers: { ...BASE_HEADERS, "Content-Type": "text/plain; charset=utf-8" } });
+  if (path === "/board.mjs") {
+    return new Response(BOARD_APP, { headers: { ...BASE_HEADERS, "Content-Type": "text/javascript; charset=utf-8" } });
   }
   if (path === "/tiantasks") {
     return new Response(CLI, { headers: { ...BASE_HEADERS, "Content-Type": "text/x-python; charset=utf-8" } });
@@ -377,15 +418,52 @@ async function handle(request, env) {
   if (method !== "GET" && request.headers.get("X-Tiantasks") !== "1") {
     return json({ error: "missing X-Tiantasks header" }, 403);
   }
-  const actor = request.headers.get("X-Tiantasks-Agent") === "claude" ? `claude-${user}` : user;
+  // Agents: "claude" acts as claude-<user>; named agents (TIANTASKS_AGENT=builder-1) act under
+  // their own name, but can't pose as another person on the board.
+  const agent = (request.headers.get("X-Tiantasks-Agent") || "").trim().toLowerCase();
+  let actor = user;
+  if (agent === "claude") actor = `claude-${user}`;
+  else if (agent) {
+    if (!AGENT_NAME.test(agent)) return json({ error: "agent names use lowercase letters, numbers, - _ ." }, 400);
+    if ([...users.values()].includes(agent) && agent !== user) return json({ error: `'${agent}' is another person's name` }, 403);
+    actor = agent;
+  }
   const store = new Store(env.DB);
   const q = url.searchParams;
-  const m = path.match(/^\/api\/items\/([A-Za-z]?-?\d+)(\/events|\/comment|\/attachments)?$/);
-  const att = path.match(/^\/api\/attachments\/(\d+)$/);
+  const m = path.match(/^\/api\/items\/([A-Za-z]?-?\d+)(\/events|\/comments?)?$/);
+  // Admins (TIANTASKS_ADMINS in wrangler.toml) can delete comments; agents never can.
+  const admins = String(env.TIANTASKS_ADMINS || "").split(",").map((a) => a.trim()).filter(Boolean);
+  const isAdmin = !agent && admins.includes(user);
+  const mc = path.match(/^\/api\/comments\/(\d+)$/);
+  if (mc && method === "DELETE") return json(await store.deleteComment(Number(mc[1]), actor, isAdmin));
+
+  const ma = path.match(/^\/api\/items\/([A-Za-z]?-?\d+)\/attachments$/);
+  if (ma && method === "POST") {
+    const declared = Number(request.headers.get("Content-Length") || 0);
+    if (declared > MAX_ATTACHMENT) {
+      throw new TTError(`the image is ${humanSize(declared)}; the limit is ${humanSize(MAX_ATTACHMENT)}`, 413);
+    }
+    const mime = (request.headers.get("Content-Type") || "").split(";")[0].trim().toLowerCase();
+    return json(await store.attach(ma[1], actor, q.get("name"), mime, await request.arrayBuffer()), 201);
+  }
+  const mf = path.match(/^\/api\/attachments\/(\d+)$/);
+  if (mf && method === "GET") {
+    const a = await store.attachment(Number(mf[1]));
+    const bytes = a.data instanceof ArrayBuffer ? a.data : new Uint8Array(a.data); // D1 may return BLOBs as number arrays
+    return new Response(bytes, {
+      headers: {
+        "Content-Type": IMAGE_TYPES.includes(a.mime) ? a.mime : "application/octet-stream",
+        "Cache-Control": "private, max-age=31536000, immutable", // ids are never reused (AUTOINCREMENT)
+        "Content-Security-Policy": "default-src 'none'",
+        "X-Content-Type-Options": "nosniff",
+      },
+    });
+  }
+  if (mf && method === "DELETE") return json(await store.deleteAttachment(Number(mf[1]), actor));
 
   if (method === "GET" && path === "/") return html(PAGE);
-  if (method === "GET" && path === "/api/version") return json({ v: await store.version(), build: PAGE_BUILD });
-  if (method === "GET" && path === "/api/me") return json({ user, actor, shared: true });
+  if (method === "GET" && path === "/api/version") return json({ v: await store.version() });
+  if (method === "GET" && path === "/api/me") return json({ user, actor, shared: true, admin: isAdmin });
   if (method === "GET" && path === "/api/state") {
     const project = q.get("project") || undefined;
     const people = new Set(users.values());
@@ -393,7 +471,7 @@ async function handle(request, env) {
       store.list({ project }), store.events({ limit: 40, project }), store.projects(), store.assignees(),
     ]);
     const assignees = new Set([...assigned, ...people, ...[...people].map((p) => `claude-${p}`)]);
-    return json({ me: user, shared: true, items, events, projects, assignees: [...assignees].sort() });
+    return json({ me: user, shared: true, admin: isAdmin, items, events, projects, assignees: [...assignees].sort() });
   }
   if (method === "GET" && path === "/api/items") {
     return json(await store.list({
@@ -413,32 +491,13 @@ async function handle(request, env) {
   if (method === "GET" && path === "/api/projects") return json(await store.projects());
   if (m && method === "GET" && !m[2]) return json(await store.get(m[1]));
   if (m && method === "GET" && m[2] === "/events") {
-    return json(await store.events({ limit: 200, itemId: (await store.get(m[1])).id }));
+    return json(await store.events({ limit: 200, ref: (await store.get(m[1])).ref }));
   }
-  if (method === "POST" && path === "/api/items") {
-    const b = await body(request);
-    let it = await store.create(b, actor);
-    if (b.status === "doing" || b.status === "done") it = await store.update(it.id, actor, { status: b.status, note: b.note });
-    return json(it, 201);
-  }
-  if (m && method === "GET" && m[2] === "/attachments") return json(await store.attachments(m[1]));
-  if (m && method === "POST" && m[2] === "/attachments") return json(await store.attach(m[1], actor, await body(request)), 201);
-  if (att && method === "GET") {
-    const a = await store.attachment(att[1]);
-    const inline = INLINE_TYPES.includes(a.mime);
-    return new Response(new Uint8Array(a.data), {
-      headers: {
-        "X-Content-Type-Options": "nosniff",
-        "Content-Type": inline ? a.mime : "application/octet-stream",
-        "Content-Disposition": `${inline ? "inline" : "attachment"}; filename*=UTF-8''${encodeURIComponent(a.name)}`,
-        "Content-Security-Policy": "sandbox; default-src 'none'",
-        "Cache-Control": "private, max-age=31536000, immutable",
-      },
-    });
-  }
-  if (att && method === "DELETE") return json(await store.detach(att[1], actor));
+  if (method === "POST" && path === "/api/items") return json(await store.create(await body(request), actor), 201);
+  if (m && method === "GET" && m[2] === "/comments") return json(await store.comments(m[1]));
   if (m && method === "POST" && m[2] === "/comment") {
-    return json(await store.comment(m[1], actor, (await body(request)).text));
+    const b = await body(request);
+    return json(await store.comment(m[1], actor, b.text, b.parent_id));
   }
   if (m && method === "PATCH" && !m[2]) {
     const b = await body(request);

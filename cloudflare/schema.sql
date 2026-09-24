@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS events (
   detail  TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS events_item ON events (item_id);
+CREATE INDEX IF NOT EXISTS events_ref ON events (ref);
 CREATE TABLE IF NOT EXISTS attachments (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   item_id    INTEGER NOT NULL,
@@ -39,3 +40,18 @@ CREATE TABLE IF NOT EXISTS attachments (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS attachments_item ON attachments (item_id);
+CREATE TABLE IF NOT EXISTS comments (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  item_id         INTEGER NOT NULL,
+  ref             TEXT NOT NULL,
+  parent_id       INTEGER,
+  author          TEXT NOT NULL,
+  body            TEXT NOT NULL,
+  created_at      TEXT NOT NULL,
+  deleted_at      TEXT,
+  deleted_by      TEXT,
+  legacy_event_id INTEGER UNIQUE
+);
+CREATE INDEX IF NOT EXISTS comments_ref ON comments (ref);
+INSERT OR IGNORE INTO comments (item_id, ref, author, body, created_at, legacy_event_id)
+  SELECT item_id, ref, actor, detail, at, id FROM events WHERE action = 'commented';

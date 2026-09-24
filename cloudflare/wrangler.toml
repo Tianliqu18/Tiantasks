@@ -10,3 +10,7 @@ rules = [{ type = "Text", globs = ["**/*.html", "**/*.txt"], fallthrough = true 
 binding = "DB"
 database_name = "tiantasks"
 database_id = "8a2ed7b9-8318-449f-aee8-5dabd7870d12"
+
+# People who can delete comments (comma-separated login names).
+[vars]
+TIANTASKS_ADMINS = "tianli"
