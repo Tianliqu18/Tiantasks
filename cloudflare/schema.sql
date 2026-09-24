@@ -28,3 +28,14 @@ CREATE TABLE IF NOT EXISTS events (
   detail  TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS events_item ON events (item_id);
+CREATE TABLE IF NOT EXISTS attachments (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  item_id    INTEGER NOT NULL,
+  name       TEXT NOT NULL,
+  mime       TEXT NOT NULL,
+  size       INTEGER NOT NULL,
+  data       BLOB NOT NULL,
+  created_by TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS attachments_item ON attachments (item_id);

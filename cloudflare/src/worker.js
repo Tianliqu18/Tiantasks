@@ -5,12 +5,23 @@
 import PAGE from "./page.html";
 import LOGIN_PAGE from "./login.html";
 import CLI from "./tiantasks.txt";
+import AGENT_GUIDE from "./llms.txt";
 
-const VERSION = "2.2.1";
+const VERSION = "2.3.0";
 const PRIORITIES = ["crit", "high", "med", "low"];
 const PRANK = Object.fromEntries(PRIORITIES.map((p, i) => [p, i]));
 const STATUSES = ["open", "doing", "done"];
 const PATCHABLE = ["status", "note", "assignee", "priority", "title", "body", "tags", "project"];
+const MAX_ATTACHMENT = 1_500_000; // a D1 row tops out at 2MB; the page shrinks screenshots to fit
+const INLINE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+// Items come back with counts the board shows on cards: files, the first image (cover), comments.
+const ITEM_SELECT = `SELECT items.*,
+  (SELECT COUNT(*) FROM attachments a WHERE a.item_id = items.id) AS files,
+  (SELECT MIN(a.id) FROM attachments a WHERE a.item_id = items.id AND a.mime LIKE 'image/%') AS cover,
+  (SELECT COUNT(*) FROM events e WHERE e.item_id = items.id AND e.action = 'commented') AS comments
+FROM items`;
+const ATT_COLS = "id, item_id, name, mime, size, created_by, created_at";
 
 class TTError extends Error {
   constructor(message, status = 400) {
@@ -45,6 +56,20 @@ const byQueue = (a, b) =>
   (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0);
 
 const toItem = (r) => ({ ...r, tags: JSON.parse(r.tags), ref: `${r.kind === "task" ? "T" : "I"}-${r.num}` });
+const toAtt = (r) => ({ id: r.id, item_id: r.item_id, name: r.name, mime: r.mime, size: r.size,
+  created_by: r.created_by, created_at: r.created_at, url: `/api/attachments/${r.id}` });
+
+function fromBase64(s) {
+  let bin;
+  try {
+    bin = atob(String(s || ""));
+  } catch {
+    throw new TTError("attachment data must be base64");
+  }
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
 
 // ------------------------------------------------------------------ store
 
@@ -56,8 +81,8 @@ class Store {
   async get(ref) {
     const [kind, num] = parseRef(ref);
     const r = kind === null
-      ? await this.db.prepare("SELECT * FROM items WHERE id = ?").bind(num).first()
-      : await this.db.prepare("SELECT * FROM items WHERE kind = ? AND num = ?").bind(kind, num).first();
+      ? await this.db.prepare(`${ITEM_SELECT} WHERE items.id = ?`).bind(num).first()
+      : await this.db.prepare(`${ITEM_SELECT} WHERE kind = ? AND num = ?`).bind(kind, num).first();
     if (!r) throw new TTError(`no item ${ref}`, 404);
     return toItem(r);
   }
@@ -90,7 +115,7 @@ class Store {
          FROM items WHERE id = (SELECT MAX(id) FROM items)`,
       ).bind(t, actor, assignee ? `for ${assignee}` : ""),
     ]);
-    return toItem(inserted.results[0]);
+    return this.get(inserted.results[0].id);
   }
 
   async update(ref, actor, ch) {
@@ -167,13 +192,58 @@ class Store {
     const it = await this.get(ref);
     await this.db.batch([
       this.db.prepare("DELETE FROM items WHERE id = ?").bind(it.id),
+      this.db.prepare("DELETE FROM attachments WHERE item_id = ?").bind(it.id),
       this.log(it, actor, "deleted"),
     ]);
     return it;
   }
 
+  async attach(ref, actor, b) {
+    const data = fromBase64(b.data);
+    if (!data.byteLength) throw new TTError("attachment is empty");
+    if (data.byteLength > MAX_ATTACHMENT) {
+      throw new TTError(`attachment is ${Math.floor(data.byteLength / 1024)} KB; the limit is ${MAX_ATTACHMENT / 1000} KB`, 413);
+    }
+    const name = String(b.name || "").split(/[\\/]/).pop().trim().slice(0, 120) || "file";
+    const mime = /^[\w.+-]+\/[\w.+-]+$/.test(b.mime || "") ? b.mime : "application/octet-stream";
+    const it = await this.get(ref);
+    const t = now();
+    const [ins] = await this.db.batch([
+      this.db.prepare(
+        `INSERT INTO attachments (item_id, name, mime, size, data, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+         RETURNING ${ATT_COLS}`,
+      ).bind(it.id, name, mime, data.byteLength, data, actor, t),
+      this.db.prepare("UPDATE items SET updated_at = ? WHERE id = ?").bind(t, it.id),
+    ]);
+    const att = toAtt(ins.results[0]);
+    await this.log(it, actor, "attached", `${name} (#${att.id})`).run();
+    return att;
+  }
+
+  async attachments(ref) {
+    const it = await this.get(ref);
+    const { results } = await this.db.prepare(`SELECT ${ATT_COLS} FROM attachments WHERE item_id = ? ORDER BY id`).bind(it.id).all();
+    return results.map(toAtt);
+  }
+
+  async attachment(id) {
+    const r = await this.db.prepare("SELECT * FROM attachments WHERE id = ?").bind(Number(id)).first();
+    if (!r) throw new TTError(`no attachment #${id}`, 404);
+    return r;
+  }
+
+  async detach(id, actor) {
+    const a = await this.attachment(id);
+    const it = await this.get(a.item_id);
+    await this.db.batch([
+      this.db.prepare("DELETE FROM attachments WHERE id = ?").bind(a.id),
+      this.log(it, actor, "detached", `${a.name} (#${a.id})`),
+    ]);
+    return toAtt(a);
+  }
+
   async list({ project, statuses, kind, assignee, grep } = {}) {
-    let sql = "SELECT * FROM items WHERE 1 = 1";
+    let sql = `${ITEM_SELECT} WHERE 1 = 1`;
     const args = [];
     if (project) { sql += " AND project = ?"; args.push(project); }
     if (statuses?.length) { sql += ` AND status IN (${statuses.map(() => "?").join(",")})`; args.push(...statuses); }
@@ -273,6 +343,9 @@ async function handle(request, env) {
   const method = request.method;
 
   if (path === "/api/ping") return json({ app: "tiantasks", version: VERSION });
+  if (path === "/llms.txt") {
+    return new Response(AGENT_GUIDE, { headers: { ...BASE_HEADERS, "Content-Type": "text/plain; charset=utf-8" } });
+  }
   if (path === "/tiantasks") {
     return new Response(CLI, { headers: { ...BASE_HEADERS, "Content-Type": "text/x-python; charset=utf-8" } });
   }
@@ -300,7 +373,8 @@ async function handle(request, env) {
   const actor = request.headers.get("X-Tiantasks-Agent") === "claude" ? `claude-${user}` : user;
   const store = new Store(env.DB);
   const q = url.searchParams;
-  const m = path.match(/^\/api\/items\/([A-Za-z]?-?\d+)(\/events|\/comment)?$/);
+  const m = path.match(/^\/api\/items\/([A-Za-z]?-?\d+)(\/events|\/comment|\/attachments)?$/);
+  const att = path.match(/^\/api\/attachments\/(\d+)$/);
 
   if (method === "GET" && path === "/") return html(PAGE);
   if (method === "GET" && path === "/api/version") return json({ v: await store.version() });
@@ -334,7 +408,28 @@ async function handle(request, env) {
   if (m && method === "GET" && m[2] === "/events") {
     return json(await store.events({ limit: 200, itemId: (await store.get(m[1])).id }));
   }
-  if (method === "POST" && path === "/api/items") return json(await store.create(await body(request), actor), 201);
+  if (method === "POST" && path === "/api/items") {
+    const b = await body(request);
+    let it = await store.create(b, actor);
+    if (b.status === "doing" || b.status === "done") it = await store.update(it.id, actor, { status: b.status, note: b.note });
+    return json(it, 201);
+  }
+  if (m && method === "GET" && m[2] === "/attachments") return json(await store.attachments(m[1]));
+  if (m && method === "POST" && m[2] === "/attachments") return json(await store.attach(m[1], actor, await body(request)), 201);
+  if (att && method === "GET") {
+    const a = await store.attachment(att[1]);
+    const inline = INLINE_TYPES.includes(a.mime);
+    return new Response(new Uint8Array(a.data), {
+      headers: {
+        "X-Content-Type-Options": "nosniff",
+        "Content-Type": inline ? a.mime : "application/octet-stream",
+        "Content-Disposition": `${inline ? "inline" : "attachment"}; filename*=UTF-8''${encodeURIComponent(a.name)}`,
+        "Content-Security-Policy": "sandbox; default-src 'none'",
+        "Cache-Control": "private, max-age=31536000, immutable",
+      },
+    });
+  }
+  if (att && method === "DELETE") return json(await store.detach(att[1], actor));
   if (m && method === "POST" && m[2] === "/comment") {
     return json(await store.comment(m[1], actor, (await body(request)).text));
   }
