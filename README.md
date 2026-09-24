@@ -21,6 +21,8 @@ tt add "Write docs" -p high -t docs
 tt issue "Login broken" -p crit -d "repro steps" --to claude-tianli
 tt resolve I-3 -m "fixed in auth.py"
 tt comment I-3 -r 12 "reply to comment c12"
+tt attach I-3 shot.png  # add screenshots (also: tt issue "…" -f shot.png)
+tt files I-3 --save /tmp/i3   # download them (how Claude looks at a ticket's screenshots)
 tt ui                   # open the web board: Queues and Board tabs, click a ticket for its full view
 tt board                # terminal kanban: OPEN → IN PROGRESS → DONE (press ? for keys)
 tt help                 # every command
@@ -35,6 +37,8 @@ whole board with `tt brief` and hands out work with `tt add "…" --to builder-1
 Workers run `tt next --wait --start`, which waits for assigned work and claims it (two agents can
 never claim the same item), then `tt resolve ID -m "…"`. The Claude Code skill installed by
 `install.sh` teaches agents both roles.
+
+Agents that talk HTTP instead of using `tt` can read the API guide at `/llms.txt` on the board.
 
 ## Shared board (Cloudflare)
 

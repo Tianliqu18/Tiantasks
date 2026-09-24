@@ -6,6 +6,7 @@ import PAGE from "./page.html";
 import LOGIN_PAGE from "./login.html";
 import CLI from "./tiantasks.txt";
 import BOARD_APP from "./board.mjs.txt";
+import AGENT_GUIDE from "./llms.txt";
 
 // Open pages compare this to what they loaded with and reload onto a new release.
 const PAGE_BUILD = (() => {
@@ -14,7 +15,7 @@ const PAGE_BUILD = (() => {
   return (h >>> 0).toString(16);
 })();
 
-const VERSION = "2.6.0";
+const VERSION = "2.7.0";
 const PRIORITIES = ["crit", "high", "med", "low"];
 const PRANK = Object.fromEntries(PRIORITIES.map((p, i) => [p, i]));
 const STATUSES = ["open", "doing", "done"];
@@ -401,6 +402,9 @@ async function handle(request, env) {
   if (path === "/board.mjs") {
     return new Response(BOARD_APP, { headers: { ...BASE_HEADERS, "Content-Type": "text/javascript; charset=utf-8" } });
   }
+  if (path === "/llms.txt") {
+    return new Response(AGENT_GUIDE, { headers: { ...BASE_HEADERS, "Content-Type": "text/plain; charset=utf-8" } });
+  }
   if (path === "/tiantasks") {
     return new Response(CLI, { headers: { ...BASE_HEADERS, "Content-Type": "text/x-python; charset=utf-8" } });
   }
@@ -445,6 +449,10 @@ async function handle(request, env) {
   if (mc && method === "DELETE") return json(await store.deleteComment(Number(mc[1]), actor, isAdmin));
 
   const ma = path.match(/^\/api\/items\/([A-Za-z]?-?\d+)\/attachments$/);
+  if (ma && method === "GET") {
+    const it = await store.get(ma[1]);
+    return json(it.attachments.map((a) => ({ ...a, url: `/api/attachments/${a.id}` })));
+  }
   if (ma && method === "POST") {
     const declared = Number(request.headers.get("Content-Length") || 0);
     if (declared > MAX_ATTACHMENT) {
@@ -478,7 +486,7 @@ async function handle(request, env) {
       store.list({ project }), store.events({ limit: 40, project }), store.projects(), store.assignees(),
     ]);
     const assignees = new Set([...assigned, ...people, ...[...people].map((p) => `claude-${p}`)]);
-    return json({ me: user, shared: true, admin: isAdmin, items, events, projects, assignees: [...assignees].sort() });
+    return json({ me: user, shared: true, admin: isAdmin, items, events, projects, assignees: [...assignees].sort(), people: [...people].sort() });
   }
   if (method === "GET" && path === "/api/items") {
     return json(await store.list({

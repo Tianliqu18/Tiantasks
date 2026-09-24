@@ -13,6 +13,7 @@ import getpass
 import hashlib
 import hmac
 import json
+import mimetypes
 import os
 import re
 import shutil
@@ -31,7 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
-VERSION = "2.6.0"
+VERSION = "2.7.0"
 DEFAULT_DB = Path.home() / ".tiantasks" / "tiantasks.db"
 CONFIG = Path.home() / ".tiantasks" / "config.json"
 DEFAULT_PORT = int(os.environ.get("TIANTASKS_PORT", 7777))
@@ -231,6 +232,13 @@ class Store:
         if not r:
             raise TTError("no such attachment", 404)
         return dict(r)
+
+    def attachments(self, ref):
+        it = self.get(ref)
+        return [{**a, "url": f"/api/attachments/{a['id']}"} for a in it["attachments"]]
+
+    def attachment_bytes(self, att_id):
+        return bytes(self.attachment(int(att_id))["data"])
 
     def delete_attachment(self, att_id, actor):
         with self.tx():
@@ -462,7 +470,8 @@ class RemoteStore:
         self.url, self.token, self._me = url.rstrip("/"), token, None
         self.path = self.url
 
-    def _req(self, method, path, body=None, params=None):
+    def _req(self, method, path, body=None, params=None, upload=None, raw=False):
+        """upload=(bytes, content_type) sends a file as-is; raw=True returns bytes instead of JSON."""
         if params:
             path += "?" + urlencode({k: v for k, v in params.items() if v is not None})
         # Cloudflare's bot check blocks Python's default User-Agent (error 1010), so name ourselves.
@@ -472,10 +481,12 @@ class RemoteStore:
         if agent:
             headers["X-Tiantasks-Agent"] = agent
         data = json.dumps(body).encode() if body is not None else None
+        if upload:
+            data, headers["Content-Type"] = upload
         req = urllib.request.Request(self.url + path, data=data, method=method, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=20, context=ssl_context()) as r:
-                return json.load(r)
+            with urllib.request.urlopen(req, timeout=60, context=ssl_context()) as r:
+                return r.read() if raw else json.load(r)
         except urllib.error.HTTPError as e:
             try:
                 msg = json.load(e).get("error")
@@ -532,6 +543,15 @@ class RemoteStore:
 
     def version(self):
         return self._req("GET", "/api/version")["v"]
+
+    def attach(self, ref, actor, name, mime, data):
+        return self._req("POST", self._item(ref) + "/attachments", params={"name": name}, upload=(data, mime))
+
+    def attachments(self, ref):
+        return self._req("GET", self._item(ref) + "/attachments")
+
+    def attachment_bytes(self, att_id):
+        return self._req("GET", f"/api/attachments/{int(att_id)}", raw=True)
 
     def close(self):
         pass
@@ -627,7 +647,51 @@ def cmd_add(args, kind=None):
     it = args.store.create(kind, " ".join(args.text), current_project(args), current_actor(args),
                            body=args.desc or "", priority=args.priority or "",
                            tags=args.tag or [], assignee=assignee or "")
+    for path in args.file or []:
+        attach_file(args, it["ref"], path)
+    if args.file:
+        it = args.store.get(it["ref"])
     emit(args, it, "added")
+
+
+def attach_file(args, ref, path):
+    p = Path(path).expanduser()
+    try:
+        data = p.read_bytes()
+    except OSError as e:
+        raise TTError(f"can't read {path}: {e.strerror}")
+    mime = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+    return args.store.attach(ref, current_actor(args), p.name, mime, data)
+
+
+def cmd_attach(args):
+    for path in args.files:
+        a = attach_file(args, args.id, path)
+        if getattr(args, "json", False):
+            print(json.dumps(a, indent=2))
+            continue
+        info = dim("(#%s, %s)" % (a["id"], human_size(a["size"])))
+        print(f"{cyan('attached')} {a['name']} {info} to {args.id.upper()}")
+
+
+def cmd_files(args):
+    """List an item's screenshots; --save downloads them (how Claude looks at them)."""
+    files = args.store.attachments(args.id)
+    if args.save:
+        out = Path(args.save).expanduser()
+        out.mkdir(parents=True, exist_ok=True)
+        for a in files:
+            dest = out / f"{a['id']}-{a['name']}"
+            dest.write_bytes(args.store.attachment_bytes(a["id"]))
+            a["path"] = str(dest)
+    if args.json:
+        print(json.dumps(files, indent=2))
+        return
+    if not files:
+        print(dim(f"no screenshots on {args.id.upper()}"))
+    for a in files:
+        where = a.get("path") or dim(a["mime"])
+        print(f"#{a['id']:<4} {a['name']}  {dim(human_size(a['size']))}  {where}")
 
 
 def cmd_resolve(args):
@@ -974,6 +1038,8 @@ def make_handler(db_path, me, users=None):
             url = urlparse(self.path)
             if url.path == "/api/ping":
                 return self._send(200, {"app": "tiantasks", "version": VERSION})
+            if url.path == "/llms.txt":  # how agents drive the board over HTTP
+                return self._send(200, AGENT_GUIDE.encode(), "text/plain; charset=utf-8")
             if url.path == "/tiantasks":  # the CLI itself, so teammates can install it from here
                 return self._send(200, Path(os.path.realpath(__file__)).read_bytes(),
                                   "text/x-python; charset=utf-8")
@@ -1022,6 +1088,8 @@ def make_handler(db_path, me, users=None):
 
         def _route(self, method, path, q, store, user, actor, is_admin=False):
             ma = re.fullmatch(r"/api/items/([A-Za-z]?-?\d+)/attachments", path)
+            if method == "GET" and ma:
+                return self._send(200, store.attachments(ma.group(1)))
             if method == "POST" and ma:
                 n = int(self.headers.get("Content-Length") or 0)
                 if n > MAX_ATTACHMENT:
@@ -1059,6 +1127,7 @@ def make_handler(db_path, me, users=None):
                     "events": store.events(40, project),
                     "projects": store.projects(),
                     "assignees": sorted(set(store.assignees()) | people | agents),
+                    "people": sorted(people),
                 })
             if method == "GET" and path == "/api/items":
                 st = q.get("status")
@@ -1266,7 +1335,9 @@ are `claude-<user>` (for example `claude-oliver`), so each person's Claude has i
 | `tt start ID` · `tt stop ID` | Mark in progress / back to open |
 | `tt resolve ID [ID…] -m "what you did"` | Check it off (shown struck through) with a resolution note |
 | `tt assign ID NAME` · `tt comment ID "text"` · `tt edit ID …` · `tt reopen ID` | Housekeeping |
-| `tt show ID` | Full details, comments, history and screenshot names (the images themselves are only viewable on the board) |
+| `tt show ID` | Full details, comment threads, screenshot names and history |
+| `tt files ID --save DIR` | Download an item's screenshots so you can look at them (then Read the printed paths) |
+| `tt attach ID FILE…` · `tt issue "title" -f shot.png` | Attach screenshots (PNG, JPEG, WebP or GIF, ≤1.9 MB each) |
 
 ## Workflow
 
@@ -1306,6 +1377,46 @@ Several agents can share one board. Each has a name, set when its session starts
 2. Do the work, then `tt resolve ID -m "<what you did, where, how you verified it>"`.
 3. If you're blocked, `tt comment ID "blocked: <why>"` and `tt stop ID` so the lead sees it.
 4. Loop back to step 1 until told to stop.
+"""
+
+AGENT_GUIDE = """# Tiantasks
+
+Task and issue queues shared by people and AI agents. Items are tasks (T-n) or issues (I-n),
+grouped by project, with status open ("Not started") -> doing ("In progress") -> done ("Complete").
+
+Prefer the `tt` CLI (`tt help`; download it from /tiantasks). It handles identity for you, and
+`tt brief` / `tt next --wait --start` cover the lead-agent / worker-agent loop.
+
+## HTTP API
+Auth: `Authorization: Bearer <token>` on a shared board. Every non-GET request must also send
+`X-Tiantasks: 1`. Agents send `X-Tiantasks-Agent: claude` (acts as `claude-<user>`) or their own
+name, e.g. `X-Tiantasks-Agent: builder-1`. Bodies are JSON. Refs accept `T-3`, `I-12` or the numeric id.
+
+GET    /api/state?project=P             items + recent events + projects + assignees + people
+GET    /api/version                     change counter; poll this, refetch when it moves
+GET    /api/items?project=&status=open,doing&kind=task|issue&assignee=&grep=
+POST   /api/items                       {kind, title, project, body, priority, tags, assignee}
+GET    /api/items/REF                   one item (with its attachments)
+PATCH  /api/items/REF                   any of {status, note, assignee, priority, title, body, tags, project}
+                                        plus optional guards {if_status, if_assignee}: 409 if the item changed
+DELETE /api/items/REF
+GET    /api/items/REF/events            history, newest first
+GET    /api/items/REF/comments          [{id, parent_id, author, body, at, deleted}] oldest first
+POST   /api/items/REF/comment           {text, parent_id?}   (parent_id replies to a comment)
+DELETE /api/comments/ID                 admins only
+GET    /api/items/REF/attachments       screenshot list: {id, name, mime, size, url}
+POST   /api/items/REF/attachments?name=shot.png   raw image bytes, Content-Type image/png|jpeg|webp|gif (<= 1.9 MB)
+GET    /api/attachments/ID              raw bytes
+DELETE /api/attachments/ID
+
+priority: crit | high | med | low | ""   status: open | doing | done (a "note" on done is the resolution)
+
+## Working an item
+1. Take it without racing other agents: PATCH {status: "doing", assignee: "<you>",
+   if_status: "<status you saw>", if_assignee: "<assignee you saw>"}; on 409, pick another item.
+2. Read the body, the comments and any screenshots before changing code.
+3. Post progress as comments (reply to questions with parent_id); attach screenshots of UI results.
+4. Finish: PATCH {status: "done", note: "<one line: what changed>"}.
 """
 
 CLAUDE_MD_SNIPPET = """
@@ -1371,6 +1482,7 @@ def build_parser():
         sp.add_argument("-t", "--tag", action="append", help="tag (repeatable)")
         sp.add_argument("-d", "--desc", help="longer description")
         sp.add_argument("--to", help="assignee (a name, 'claude' or 'me')")
+        sp.add_argument("-f", "--file", action="append", help="attach a screenshot (repeatable)")
         sp.add_argument("--json", action="store_true")
         if name == "add":
             sp.add_argument("-i", "--issue", action="store_true", help="make it an issue")
@@ -1431,6 +1543,16 @@ def build_parser():
     sp.add_argument("--timeout", type=int, metavar="SECS", help="with --wait, give up after this long")
     sp.add_argument("--interval", type=int, metavar="SECS", help="with --wait, how often to check")
     sp.add_argument("-A", "--all-projects", action="store_true")
+    sp.add_argument("--json", action="store_true")
+
+    sp = add_cmd("attach", cmd_attach, "attach screenshots to an item")
+    sp.add_argument("id", metavar="ID")
+    sp.add_argument("files", nargs="+", metavar="FILE")
+    sp.add_argument("--json", action="store_true")
+
+    sp = add_cmd("files", cmd_files, "list an item's screenshots (--save DIR downloads them)")
+    sp.add_argument("id", metavar="ID")
+    sp.add_argument("--save", metavar="DIR", help="download them into DIR and print the paths")
     sp.add_argument("--json", action="store_true")
 
     sp = add_cmd("brief", cmd_brief, "board snapshot for a lead agent: unassigned, queued, in progress, done, team")
@@ -2294,7 +2416,7 @@ function prioIcon(p) {
   const bar = (x, h, n) => `<rect x="${x}" y="${14 - h}" width="3" height="${h}" rx="1" fill="currentColor" opacity="${n <= lvl ? 1 : .22}"/>`;
   return `<svg class="pi" viewBox="0 0 16 16" role="img" aria-label="Priority ${p}"><title>${p}</title>${bar(1.5, 5, 1)}${bar(6.5, 8.5, 2)}${bar(11.5, 12, 3)}</svg>`;
 }
-const isAgent = n => n === 'claude' || /^claude-/.test(n || '');
+const isAgent = n => !!n && (n === 'claude' || /^claude-/.test(n) || !!(S && S.people && !S.people.includes(n)));
 function avatar(name, lg) {
   const cls = 'av' + (lg ? ' lg' : '');
   if (!name) return `<span class="${cls} none" title="Unassigned"></span>`;
