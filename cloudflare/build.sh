@@ -7,6 +7,11 @@ import runpy
 g = runpy.run_path("../tiantasks")  # run_path doesn't trigger main()
 open("src/page.html", "w").write(g["PAGE"])
 open("src/login.html", "w").write(g["LOGIN_PAGE"])
-open("schema.sql", "w").write(g["SCHEMA"].strip() + "\n")
+open("schema.sql", "w").write(g["SCHEMA"].strip() + "\n" + g["LEGACY_COMMENTS_SQL"].strip() + "\n")
 PY
 cp ../tiantasks src/tiantasks.txt
+# The `tt board` app, served at /board.mjs so teammates' `tt board` can download it.
+if [[ ! -f ../board/dist/board.mjs || ../board/src/board.jsx -nt ../board/dist/board.mjs ]]; then
+  (cd ../board && { [[ -d node_modules ]] || npm install --no-fund --no-audit >/dev/null; } && npm run --silent build >/dev/null)
+fi
+cp ../board/dist/board.mjs src/board.mjs.txt

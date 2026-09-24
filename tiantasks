@@ -14,6 +14,7 @@ import hmac
 import json
 import os
 import re
+import shutil
 import sqlite3
 import ssl
 import subprocess
@@ -29,13 +30,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
-VERSION = "2.2.1"
+VERSION = "2.6.0"
 DEFAULT_DB = Path.home() / ".tiantasks" / "tiantasks.db"
 CONFIG = Path.home() / ".tiantasks" / "config.json"
 DEFAULT_PORT = int(os.environ.get("TIANTASKS_PORT", 7777))
 PRIORITIES = ("crit", "high", "med", "low")
 PRANK = {p: i for i, p in enumerate(PRIORITIES)}
 STATUSES = ("open", "doing", "done")
+AGENT_NAME = re.compile(r"[a-z0-9][a-z0-9_.-]{0,39}")
+IMAGE_TYPES = ("image/png", "image/jpeg", "image/webp", "image/gif")
+MAX_ATTACHMENT = 1_900_000  # D1 rows top out at 2 MB; the page shrinks screenshots to fit
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -68,7 +72,47 @@ CREATE TABLE IF NOT EXISTS events (
   detail  TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS events_item ON events (item_id);
+CREATE INDEX IF NOT EXISTS events_ref ON events (ref);
+CREATE TABLE IF NOT EXISTS attachments (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  item_id    INTEGER NOT NULL,
+  name       TEXT NOT NULL,
+  mime       TEXT NOT NULL,
+  size       INTEGER NOT NULL,
+  data       BLOB NOT NULL,
+  created_by TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS attachments_item ON attachments (item_id);
+CREATE TABLE IF NOT EXISTS comments (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  item_id         INTEGER NOT NULL,
+  ref             TEXT NOT NULL,
+  parent_id       INTEGER,
+  author          TEXT NOT NULL,
+  body            TEXT NOT NULL,
+  created_at      TEXT NOT NULL,
+  deleted_at      TEXT,
+  deleted_by      TEXT,
+  legacy_event_id INTEGER UNIQUE
+);
+CREATE INDEX IF NOT EXISTS comments_ref ON comments (ref);
 """
+# Comments used to be stored only as 'commented' events; copy them into the comments table once.
+LEGACY_COMMENTS_SQL = """
+INSERT OR IGNORE INTO comments (item_id, ref, author, body, created_at, legacy_event_id)
+  SELECT item_id, ref, actor, detail, at, id FROM events WHERE action = 'commented';
+"""
+# Comment events use these actions; history views hide them because comments have their own list.
+COMMENT_ACTIONS = ("commented", "added a comment", "replied", "deleted a comment")
+
+
+NEXT_NUM_SQL = """
+SELECT COALESCE(MAX(n), 0) + 1 FROM (
+  SELECT MAX(num) AS n FROM items WHERE kind = ?1
+  UNION ALL
+  SELECT MAX(CAST(substr(ref, 3) AS INTEGER)) FROM events WHERE substr(ref, 1, 1) = ?2
+)"""
 
 
 class TTError(Exception):
@@ -94,6 +138,15 @@ def parse_ref(ref):
     return ("task" if m.group(1).upper() == "T" else "issue"), int(m.group(2))
 
 
+def clean_filename(name):
+    name = re.sub(r"[^\w.\- ]+", "_", Path(str(name or "")).name).strip(" ._")
+    return name[:100] or "screenshot"
+
+
+def human_size(n):
+    return f"{n / 1_000_000:.1f} MB" if n >= 1_000_000 else f"{max(1, round(n / 1000))} KB"
+
+
 def clean_tags(tags):
     if isinstance(tags, str):
         tags = re.split(r"[,\s]+", tags)
@@ -111,6 +164,8 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
+        if self.db.execute("PRAGMA user_version").fetchone()[0] < 1:
+            self.db.executescript(LEGACY_COMMENTS_SQL + "PRAGMA user_version = 1;")
 
     def close(self):
         self.db.close()
@@ -140,7 +195,49 @@ class Store:
             r = self.db.execute("SELECT * FROM items WHERE kind=? AND num=?", (kind, num)).fetchone()
         if not r:
             raise TTError(f"no item {ref}", 404)
-        return self._row(r)
+        item = self._row(r)
+        item["attachments"] = self._attachment_meta(item["id"]).get(item["id"], [])
+        return item
+
+    def _attachment_meta(self, item_id=None):
+        sql = "SELECT id, item_id, name, mime, size FROM attachments"
+        rows = self.db.execute(sql + (" WHERE item_id=?" if item_id else "") + " ORDER BY id",
+                               (item_id,) if item_id else ())
+        meta = {}
+        for r in rows:
+            meta.setdefault(r["item_id"], []).append(
+                {"id": r["id"], "name": r["name"], "mime": r["mime"], "size": r["size"]})
+        return meta
+
+    def attach(self, ref, actor, name, mime, data):
+        if mime not in IMAGE_TYPES:
+            raise TTError("only PNG, JPEG, WebP or GIF images can be attached", 415)
+        if not data:
+            raise TTError("the image is empty")
+        if len(data) > MAX_ATTACHMENT:
+            raise TTError(f"the image is {human_size(len(data))}; the limit is {human_size(MAX_ATTACHMENT)}", 413)
+        name = clean_filename(name)
+        with self.tx():
+            it = self.get(ref)
+            cur = self.db.execute(
+                "INSERT INTO attachments (item_id, name, mime, size, data, created_by, created_at)"
+                " VALUES (?,?,?,?,?,?,?)", (it["id"], name, mime, len(data), data, actor, now_iso()))
+            self._log(it, actor, "attached", name)
+        return {"id": cur.lastrowid, "name": name, "mime": mime, "size": len(data)}
+
+    def attachment(self, att_id):
+        r = self.db.execute("SELECT * FROM attachments WHERE id=?", (att_id,)).fetchone()
+        if not r:
+            raise TTError("no such attachment", 404)
+        return dict(r)
+
+    def delete_attachment(self, att_id, actor):
+        with self.tx():
+            a = self.attachment(att_id)
+            it = self.get(a["item_id"])
+            self.db.execute("DELETE FROM attachments WHERE id=?", (att_id,))
+            self._log(it, actor, "removed screenshot", a["name"])
+        return {"ok": True}
 
     def _log(self, item, actor, action, detail=""):
         self.db.execute(
@@ -158,8 +255,8 @@ class Store:
             raise TTError(f"priority must be one of {', '.join(PRIORITIES)}")
         now = now_iso()
         with self.tx():
-            num = self.db.execute("SELECT COALESCE(MAX(num), 0) + 1 FROM items WHERE kind=?",
-                                  (kind,)).fetchone()[0]
+            # Count deleted items too (they live on in events), so a number is never reused.
+            num = self.db.execute(NEXT_NUM_SQL, (kind, "T" if kind == "task" else "I")).fetchone()[0]
             cur = self.db.execute(
                 "INSERT INTO items (kind, num, project, title, body, priority, tags, assignee,"
                 " created_by, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -170,8 +267,15 @@ class Store:
         return item
 
     def update(self, ref, actor, **ch):
+        if_status, if_assignee = ch.pop("if_status", None), ch.pop("if_assignee", None)
         with self.tx():
             it = self.get(ref)
+            # Optional guards so two agents can't claim the same item.
+            if if_status is not None and it["status"] != if_status:
+                raise TTError(f"{it['ref']} is already {it['status']}" +
+                              (f" ({it['assignee']})" if it["assignee"] else ""), 409)
+            if if_assignee is not None and it["assignee"] != if_assignee:
+                raise TTError(f"{it['ref']} was just assigned to {it['assignee'] or 'nobody'}", 409)
             sets, events = {}, []
             status = ch.get("status")
             note = ch.get("note")
@@ -225,18 +329,57 @@ class Store:
                 self._log(it, actor, action, detail)
         return it
 
-    def comment(self, ref, actor, text):
-        if not text.strip():
+    @staticmethod
+    def _comment_row(r):
+        deleted = bool(r["deleted_at"])
+        return {"id": r["id"], "parent_id": r["parent_id"], "author": r["author"],
+                "body": "" if deleted else r["body"], "at": r["created_at"], "deleted": deleted}
+
+    def comments(self, ref):
+        """All comments on an item, oldest first. Replies carry parent_id (threads are one level)."""
+        it = self.get(ref)
+        rows = self.db.execute("SELECT * FROM comments WHERE ref=? ORDER BY id", (it["ref"],))
+        return [self._comment_row(r) for r in rows]
+
+    def comment(self, ref, actor, text, parent_id=None):
+        text = (text or "").strip()
+        if not text:
             raise TTError("comment cannot be empty")
         with self.tx():
             it = self.get(ref)
-            self._log(it, actor, "commented", text.strip())
-        return it
+            if parent_id:
+                p = self.db.execute("SELECT id, parent_id, author FROM comments WHERE id=? AND ref=?",
+                                    (int(parent_id), it["ref"])).fetchone()
+                if not p:
+                    raise TTError(f"no comment {parent_id} on {it['ref']}", 404)
+                parent_id = p["parent_id"] or p["id"]  # replying to a reply joins the same thread
+            cur = self.db.execute(
+                "INSERT INTO comments (item_id, ref, parent_id, author, body, created_at) VALUES (?,?,?,?,?,?)",
+                (it["id"], it["ref"], parent_id or None, actor, text, now_iso()))
+            self._log(it, actor, "replied" if parent_id else "added a comment", text)
+            row = self.db.execute("SELECT * FROM comments WHERE id=?", (cur.lastrowid,)).fetchone()
+        return self._comment_row(row)
+
+    def delete_comment(self, cid, actor, is_admin):
+        if not is_admin:
+            raise TTError("only an admin can delete comments", 403)
+        with self.tx():
+            r = self.db.execute("SELECT * FROM comments WHERE id=?", (int(cid),)).fetchone()
+            if not r or r["deleted_at"]:
+                raise TTError(f"no comment {cid}", 404)
+            it = self.get(r["ref"])
+            # Soft delete, so replies to it still make sense ("comment deleted" stays in the thread).
+            self.db.execute("UPDATE comments SET deleted_at=?, deleted_by=?, body='' WHERE id=?",
+                            (now_iso(), actor, r["id"]))
+            self._log(it, actor, "deleted a comment", f"by {r['author']}")
+        return {"ok": True}
 
     def delete(self, ref, actor):
         with self.tx():
             it = self.get(ref)
             self.db.execute("DELETE FROM items WHERE id=?", (it["id"],))
+            self.db.execute("DELETE FROM attachments WHERE item_id=?", (it["id"],))
+            self.db.execute("DELETE FROM comments WHERE ref=?", (it["ref"],))
             self._log(it, actor, "deleted")
         return it
 
@@ -253,14 +396,19 @@ class Store:
         if grep:
             sql += " AND (title LIKE ? OR body LIKE ? OR note LIKE ?)"; args += [f"%{grep}%"] * 3
         items = [self._row(r) for r in self.db.execute(sql, args)]
+        meta = self._attachment_meta()
+        for it in items:
+            it["attachments"] = meta.get(it["id"], [])
         return sorted(items, key=sort_key)
 
-    def events(self, limit=40, project=None, item_id=None):
+    def events(self, limit=40, project=None, item_id=None, ref=None):
         sql, args = "SELECT * FROM events WHERE 1=1", []
+        if item_id and not ref:
+            ref = self.get(item_id)["ref"]  # history follows the T-/I- number, which is never reused
         if project:
             sql += " AND project=?"; args.append(project)
-        if item_id:
-            sql += " AND item_id=?"; args.append(item_id)
+        if ref:
+            sql += " AND ref=?"; args.append(ref)
         sql += " ORDER BY id DESC LIMIT ?"; args.append(limit)
         return [dict(r) for r in self.db.execute(sql, args)]
 
@@ -274,8 +422,11 @@ class Store:
         return [dict(r) for r in rows]
 
     def assignees(self):
-        return [r[0] for r in self.db.execute(
-            "SELECT DISTINCT assignee FROM items WHERE assignee != '' ORDER BY assignee")]
+        """Everyone items can be assigned to: current assignees plus anyone recently active."""
+        rows = self.db.execute(
+            "SELECT assignee FROM items WHERE assignee != '' UNION "
+            "SELECT actor FROM (SELECT actor FROM events ORDER BY id DESC LIMIT 500) ORDER BY 1")
+        return [r[0] for r in rows]
 
 
 # ---------------------------------------------------------------- remote board
@@ -284,6 +435,8 @@ def load_config():
     """Return {url, token} for a shared board, or None to use the local database."""
     if os.environ.get("TIANTASKS_URL"):
         return {"url": os.environ["TIANTASKS_URL"], "token": os.environ.get("TIANTASKS_TOKEN", "")}
+    if os.environ.get("TIANTASKS_DB"):
+        return None  # an explicitly chosen database always wins over the saved shared board
     try:
         cfg = json.loads(CONFIG.read_text())
     except (OSError, ValueError):
@@ -314,8 +467,9 @@ class RemoteStore:
         # Cloudflare's bot check blocks Python's default User-Agent (error 1010), so name ourselves.
         headers = {"Authorization": f"Bearer {self.token}", "X-Tiantasks": "1",
                    "Content-Type": "application/json", "User-Agent": f"tiantasks-cli/{VERSION}"}
-        if os.environ.get("CLAUDECODE"):
-            headers["X-Tiantasks-Agent"] = "claude"
+        agent = os.environ.get("TIANTASKS_AGENT") or ("claude" if os.environ.get("CLAUDECODE") else "")
+        if agent:
+            headers["X-Tiantasks-Agent"] = agent
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.url + path, data=data, method=method, headers=headers)
         try:
@@ -351,8 +505,14 @@ class RemoteStore:
     def update(self, ref, actor, **ch):
         return self._req("PATCH", self._item(ref), ch)
 
-    def comment(self, ref, actor, text):
-        return self._req("POST", self._item(ref) + "/comment", {"text": text})
+    def comment(self, ref, actor, text, parent_id=None):
+        return self._req("POST", self._item(ref) + "/comment", {"text": text, "parent_id": parent_id})
+
+    def comments(self, ref):
+        return self._req("GET", self._item(ref) + "/comments")
+
+    def delete_comment(self, cid, actor, is_admin=None):
+        return self._req("DELETE", f"/api/comments/{int(cid)}")
 
     def delete(self, ref, actor):
         return self._req("DELETE", self._item(ref))
@@ -369,6 +529,9 @@ class RemoteStore:
     def projects(self):
         return self._req("GET", "/api/projects")
 
+    def version(self):
+        return self._req("GET", "/api/version")["v"]
+
     def close(self):
         pass
 
@@ -383,6 +546,8 @@ def current_actor(args=None):
         return args.actor
     if os.environ.get("TIANTASKS_ACTOR"):
         return os.environ["TIANTASKS_ACTOR"]
+    if os.environ.get("TIANTASKS_AGENT"):
+        return os.environ["TIANTASKS_AGENT"]
     if os.environ.get("CLAUDECODE"):
         return "claude"
     return getpass.getuser()
@@ -435,6 +600,8 @@ def fmt(it, show_project=False):
     if it["assignee"]:
         extras.append(cyan("@" + it["assignee"]))
     extras += [dim("#" + t) for t in it["tags"]]
+    if it.get("attachments"):
+        extras.append(dim(f"📎{len(it['attachments'])}"))
     if show_project:
         extras.append(dim(f"[{it['project']}]"))
     if it["status"] == "done":
@@ -505,9 +672,43 @@ def cmd_edit(args):
     emit(args, args.store.update(args.id, current_actor(args), **ch), "edited", cyan)
 
 
+def is_local_admin():
+    """On your own machine you're the admin, but agents never are."""
+    return not (os.environ.get("TIANTASKS_AGENT") or os.environ.get("CLAUDECODE"))
+
+
 def cmd_comment(args):
-    it = args.store.comment(args.id, current_actor(args), " ".join(args.text))
-    print(f"{cyan('commented on')} {it['ref']}")
+    if args.delete:
+        args.store.delete_comment(args.delete, current_actor(args), is_local_admin())
+        print(f"{red('deleted comment')} c{args.delete}")
+        return
+    if not args.text:
+        die("write the comment text (or --delete CID)")
+    c = args.store.comment(args.id, current_actor(args), " ".join(args.text), args.reply)
+    verb = "replied on" if c["parent_id"] else "commented on"
+    print(f"{cyan(verb)} {args.id.upper()} " + dim(f"(c{c['id']})"))
+
+
+def print_threads(comments, indent="  "):
+    """Comments as threads: each top-level comment, then its replies indented under it."""
+    replies = {}
+    for c in comments:
+        if c["parent_id"]:
+            replies.setdefault(c["parent_id"], []).append(c)
+    for c in (c for c in comments if not c["parent_id"]):
+        kids = replies.get(c["id"], [])
+        if c["deleted"] and not kids:
+            continue
+        head = dim("comment deleted") if c["deleted"] else f"{bold(c['author'])} {dim(show_ts(c['at']))}"
+        print(f"{indent}" + dim(f"c{c['id']}") + f" {head}")
+        if not c["deleted"]:
+            print(f"{indent}    " + c["body"].replace("\n", f"\n{indent}    "))
+        for r in kids:
+            if r["deleted"]:
+                print(f"{indent}  ╰ {dim('reply deleted')}")
+                continue
+            print(f"{indent}  ╰ " + dim(f"c{r['id']}") + f" {bold(r['author'])} {dim(show_ts(r['at']))}")
+            print(f"{indent}      " + r["body"].replace("\n", f"\n{indent}      "))
 
 
 def cmd_remove(args):
@@ -544,42 +745,138 @@ def cmd_list(args):
                 print("  " + fmt(i, show_project=project is None))
 
 
+def comments_for(store, it):
+    return [c for c in store.comments(it["ref"]) if not c["deleted"]]
+
+
+def pick_next(args, who, project):
+    """The top item for `who`: their in-progress work first, then open items by priority.
+    With --start, claims it atomically, so parallel agents never grab the same item."""
+    items = args.store.list(project, ["open", "doing"], None, who)
+    if not items and args.any:
+        items = args.store.list(project, ["open"], None, "")
+    for it in items:
+        if not args.start or it["status"] == "doing":
+            return it
+        try:
+            return args.store.update(it["id"], current_actor(args), status="doing", assignee=who,
+                                     if_status=it["status"], if_assignee=it["assignee"])
+        except TTError as e:
+            if e.status != 409:
+                raise  # someone else got it first; try the next one
+    return None
+
+
 def cmd_next(args):
     who = args.for_ or current_actor(args)
     project = None if args.all_projects else current_project(args)
-    items = args.store.list(project, ["open", "doing"], None, who)
-    if not items and args.any:
-        items = args.store.list(project, ["open", "doing"], None, "")
-    if not items:
-        if args.json:
-            print("null")
-        else:
-            print(dim(f"no open items for {who} in {project or 'any project'}."))
+    remote = isinstance(args.store, RemoteStore)
+    interval = args.interval or (5 if remote else 2)
+    deadline = time.time() + args.timeout if args.timeout else None
+    it = pick_next(args, who, project)
+    if not it and args.wait:
+        print(dim(f"waiting for work for {who} in {project or 'any project'}… (Ctrl-C to stop)"), file=sys.stderr)
+        try:
+            while not it and (deadline is None or time.time() < deadline):
+                seen = args.store.version()  # one tiny read per poll; the list is only re-read on change
+                while args.store.version() == seen and (deadline is None or time.time() < deadline):
+                    time.sleep(interval)
+                it = pick_next(args, who, project)
+        except KeyboardInterrupt:
+            pass
+    if not it:
+        print("null" if args.json else dim(f"no open items for {who} in {project or 'any project'}."))
         return
-    it = items[0]
-    if args.start and it["status"] != "doing":
-        it = args.store.update(it["id"], current_actor(args), status="doing", assignee=who)
+    comments = comments_for(args.store, it)
     if args.json:
-        print(json.dumps(it, indent=2))
+        print(json.dumps({**it, "comments": comments}, indent=2))
         return
     print(fmt(it, show_project=project is None))
     if it["body"]:
         print("\n" + it["body"])
+    if comments:
+        print(dim("\ncomments:"))
+        print_threads(comments)
+    if it.get("attachments"):
+        print(dim(f"\n(screenshots on the board: {', '.join(a['name'] for a in it['attachments'])})"))
+
+
+def cmd_brief(args):
+    """A one-read snapshot of the board, written for a lead agent that hands out work."""
+    project = None if args.all_projects else current_project(args)
+    items = args.store.list(project)
+    events = args.store.events(300, project)
+    first_line = lambda t: (t or "").strip().split("\n")[0][:160]
+    open_ = [i for i in items if i["status"] == "open"]
+    unassigned = [i for i in open_ if not i["assignee"]]
+    queued = [i for i in open_ if i["assignee"]]
+    doing = [i for i in items if i["status"] == "doing"]
+    done = sorted((i for i in items if i["status"] == "done"), key=lambda i: i["resolved_at"], reverse=True)[:args.done]
+    last_seen = {}
+    for e in events:  # newest first
+        last_seen.setdefault(e["actor"], e["at"])
+    team = sorted({i["assignee"] for i in queued + doing} | set(last_seen))
+    roster = [{"name": n,
+               "working_on": [i["ref"] for i in doing if i["assignee"] == n],
+               "queued": [i["ref"] for i in queued if i["assignee"] == n],
+               "last_active": last_seen.get(n)} for n in team]
+    if args.json:
+        print(json.dumps({"project": project, "you": current_actor(args), "unassigned": unassigned,
+                          "queued": queued, "in_progress": doing, "recently_done": done, "team": roster}, indent=2))
+        return
+
+    def line(i, who=True):
+        bits = [i["ref"]]
+        if i["priority"]:
+            bits.append(f"[{i['priority']}]")
+        if who and i["assignee"]:
+            bits.append(f"@{i['assignee']}")
+        bits.append(i["title"])
+        extra = first_line(i["body"])
+        if i.get("attachments"):
+            extra += f" (📎{len(i['attachments'])})"
+        return "- " + " ".join(bits) + (f" — {extra}" if extra.strip() else "")
+
+    print(f"# Tiantasks brief · {project or 'all projects'} · you are {current_actor(args)}")
+    print(f"\n## Unassigned, ready to hand out ({len(unassigned)})")
+    print("\n".join(line(i) for i in unassigned) or "- none")
+    print(f"\n## Assigned, not started ({len(queued)})")
+    print("\n".join(line(i) for i in queued) or "- none")
+    print(f"\n## In progress ({len(doing)})")
+    print("\n".join(line(i) + f" (started {show_ts(i['updated_at'])})" for i in doing) or "- none")
+    print(f"\n## Recently done ({len(done)})")
+    print("\n".join(f"- {i['ref']} @{i['assignee'] or '?'} {i['title']}" + (f" — {i['note']}" if i["note"] else "")
+                    for i in done) or "- none")
+    print("\n## Team")
+    for r in roster:
+        status = f"working on {', '.join(r['working_on'])}" if r["working_on"] else "idle"
+        q = f", {len(r['queued'])} queued" if r["queued"] else ""
+        seen = f", last active {show_ts(r['last_active'])}" if r["last_active"] else ""
+        print(f"- {r['name']}: {status}{q}{seen}")
+    print("\nUse `tt show ID` for full details and comments.")
 
 
 def cmd_show(args):
     it = args.store.get(args.id)
-    history = args.store.events(100, item_id=it["id"])
+    history = args.store.events(100, item_id=it["id"])  # remote boards map this to the item's ref
+    comments = args.store.comments(it["ref"])
     if args.json:
-        print(json.dumps({**it, "history": history}, indent=2))
+        print(json.dumps({**it, "comments": comments, "history": history}, indent=2))
         return
     print(fmt(it))
     print(dim(f"  {it['kind']} · project {it['project']} · opened {show_ts(it['created_at'])}"
               f" by {it['created_by']}"))
     if it["body"]:
         print("\n  " + it["body"].replace("\n", "\n  "))
+    if it.get("attachments"):
+        print(dim("\n  screenshots (view them on the board):"))
+        for a in it["attachments"]:
+            print(f"    📎 {a['name']}  {dim(human_size(a['size']))}")
+    if any(not c["deleted"] for c in comments):
+        print(dim("\n  comments (reply: tt comment ID -r CID \"text\"):"))
+        print_threads(comments, indent="    ")
     print(dim("\n  history:"))
-    for e in reversed(history):
+    for e in reversed([e for e in history if e["action"] not in COMMENT_ACTIONS]):
         detail = f": {e['detail']}" if e["detail"] else ""
         print(dim(f"    {show_ts(e['at'])}  {e['actor']} {e['action']}{detail}"))
 
@@ -630,7 +927,8 @@ def make_handler(db_path, me, users=None):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
+            if not any(k == "Cache-Control" for k, _ in headers):
+                self.send_header("Cache-Control", "no-store")
             for k, v in headers:
                 self.send_header(k, v)
             self.end_headers()
@@ -696,12 +994,24 @@ def make_handler(db_path, me, users=None):
             if method != "GET" and self.headers.get("X-Tiantasks") != "1":
                 return self._send(403, {"error": "missing X-Tiantasks header"})
             actor = user
-            if self.headers.get("X-Tiantasks-Agent") == "claude":
+            agent = (self.headers.get("X-Tiantasks-Agent") or "").strip().lower()
+            admins = {a.strip() for a in os.environ.get("TIANTASKS_ADMINS", "").split(",") if a.strip()}
+            # Admins can delete comments. On a private board that's you; agents never are.
+            is_admin = not agent and (users is None or user in admins)
+            if agent == "claude":
                 actor = "claude" if users is None else f"claude-{user}"
+            elif agent:
+                # Named agents (TIANTASKS_AGENT=builder-1) act under their own name, but can't
+                # pose as another person on a shared board.
+                if not AGENT_NAME.fullmatch(agent):
+                    return self._send(400, {"error": "agent names use lowercase letters, numbers, - _ ."})
+                if users is not None and agent in users.values() and agent != user:
+                    return self._send(403, {"error": f"'{agent}' is another person's name"})
+                actor = agent
             q = {k: v[0] for k, v in parse_qs(url.query, keep_blank_values=True).items()}
             store = Store(db_path)
             try:
-                return self._route(method, url.path, q, store, user, actor)
+                return self._route(method, url.path, q, store, user, actor, is_admin)
             except TTError as e:
                 return self._send(e.status, {"error": str(e)})
             except (ValueError, KeyError, TypeError) as e:
@@ -709,20 +1019,41 @@ def make_handler(db_path, me, users=None):
             finally:
                 store.close()
 
-        def _route(self, method, path, q, store, user, actor):
-            m = re.fullmatch(r"/api/items/([A-Za-z]?-?\d+)(/events|/comment)?", path)
+        def _route(self, method, path, q, store, user, actor, is_admin=False):
+            ma = re.fullmatch(r"/api/items/([A-Za-z]?-?\d+)/attachments", path)
+            if method == "POST" and ma:
+                n = int(self.headers.get("Content-Length") or 0)
+                if n > MAX_ATTACHMENT:
+                    self.close_connection = True
+                    raise TTError(f"the image is {human_size(n)}; the limit is {human_size(MAX_ATTACHMENT)}", 413)
+                mime = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                return self._send(201, store.attach(ma.group(1), actor, q.get("name"), mime, self.rfile.read(n)))
+            mf = re.fullmatch(r"/api/attachments/(\d+)", path)
+            if method == "GET" and mf:
+                a = store.attachment(int(mf.group(1)))
+                return self._send(200, a["data"], a["mime"], headers=[
+                    ("Cache-Control", "private, max-age=31536000, immutable"),
+                    ("Content-Security-Policy", "default-src 'none'"),
+                    ("X-Content-Type-Options", "nosniff")])
+            if method == "DELETE" and mf:
+                return self._send(200, store.delete_attachment(int(mf.group(1)), actor))
+            mc = re.fullmatch(r"/api/comments/(\d+)", path)
+            if method == "DELETE" and mc:
+                return self._send(200, store.delete_comment(int(mc.group(1)), actor, is_admin))
+            m = re.fullmatch(r"/api/items/([A-Za-z]?-?\d+)(/events|/comments?)?", path)
             if method == "GET" and path == "/":
                 return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
             if method == "GET" and path == "/api/version":
                 return self._send(200, {"v": store.version()})
             if method == "GET" and path == "/api/me":
-                return self._send(200, {"user": user, "actor": actor, "shared": users is not None})
+                return self._send(200, {"user": user, "actor": actor, "shared": users is not None,
+                                        "admin": is_admin})
             if method == "GET" and path == "/api/state":
                 project = q.get("project") or None
                 people = set(users.values()) if users is not None else {me}
                 agents = {f"claude-{p}" for p in people} if users is not None else {"claude"}
                 return self._send(200, {
-                    "me": user, "shared": users is not None,
+                    "me": user, "shared": users is not None, "admin": is_admin,
                     "items": store.list(project),
                     "events": store.events(40, project),
                     "projects": store.projects(),
@@ -742,17 +1073,21 @@ def make_handler(db_path, me, users=None):
             if method == "GET" and m and not m.group(2):
                 return self._send(200, store.get(m.group(1)))
             if method == "GET" and m and m.group(2) == "/events":
-                return self._send(200, store.events(200, item_id=store.get(m.group(1))["id"]))
+                return self._send(200, store.events(200, ref=store.get(m.group(1))["ref"]))
             if method == "POST" and path == "/api/items":
                 b = self._body()
                 return self._send(201, store.create(
                     b.get("kind", "task"), b.get("title", ""), b.get("project") or "general", actor,
                     body=b.get("body", ""), priority=b.get("priority", ""),
                     tags=b.get("tags", []), assignee=b.get("assignee", "")))
+            if method == "GET" and m and m.group(2) == "/comments":
+                return self._send(200, store.comments(m.group(1)))
             if method == "POST" and m and m.group(2) == "/comment":
-                return self._send(200, store.comment(m.group(1), actor, self._body().get("text", "")))
+                b = self._body()
+                return self._send(200, store.comment(m.group(1), actor, b.get("text", ""), b.get("parent_id")))
             if method == "PATCH" and m and not m.group(2):
-                allowed = {"status", "note", "assignee", "priority", "title", "body", "tags", "project"}
+                allowed = {"status", "note", "assignee", "priority", "title", "body", "tags", "project",
+                           "if_status", "if_assignee"}
                 ch = {k: v for k, v in self._body().items() if k in allowed}
                 return self._send(200, store.update(m.group(1), actor, **ch))
             if method == "DELETE" and m and not m.group(2):
@@ -827,6 +1162,60 @@ def cmd_whoami(args):
         print(f"{current_actor(args)}  (local board {args.store.path})")
 
 
+def ensure_local_server(store, port):
+    """Start the private board's web server in the background if it isn't running."""
+    if server_up(port):
+        return
+    log = open(store.path.parent / "server.log", "a")
+    env = {**os.environ, "TIANTASKS_DB": str(store.path)}
+    for var in ("CLAUDECODE", "TIANTASKS_ACTOR", "TIANTASKS_AGENT"):
+        env.pop(var, None)  # edits made on the page are yours, not an agent's
+    subprocess.Popen([sys.executable, os.path.realpath(__file__), "serve", "--port", str(port)],
+                     stdout=log, stderr=log, stdin=subprocess.DEVNULL, env=env, start_new_session=True)
+    for _ in range(50):
+        if server_up(port):
+            return
+        time.sleep(0.1)
+    die(f"server didn't start; see {log.name}")
+
+
+BOARD_JS = Path.home() / ".tiantasks" / "board.mjs"
+
+
+def cmd_board(args):
+    """The terminal kanban (React + Ink, bundled into one file that runs on Node 18+)."""
+    node = shutil.which("node")
+    if not node:
+        die("`tt board` needs Node.js 18 or newer: https://nodejs.org (or `brew install node`)")
+    major = subprocess.run([node, "--version"], capture_output=True, text=True).stdout.strip().lstrip("v")
+    if int(major.split(".")[0] or 0) < 18:
+        die(f"`tt board` needs Node.js 18 or newer (you have {major})")
+    dev = Path(os.path.realpath(__file__)).parent / "board" / "dist" / "board.mjs"
+    script = dev if dev.exists() else BOARD_JS
+    if isinstance(args.store, RemoteStore):
+        url, token = args.store.url, args.store.token
+        # Keep the board app in step with the shared board's version.
+        stamp = BOARD_JS.with_suffix(".version")
+        remote_version = args.store._req("GET", "/api/ping")["version"]
+        if script == BOARD_JS and (not BOARD_JS.exists() or args.update or
+                                   (stamp.read_text().strip() if stamp.exists() else "") != remote_version):
+            print(dim("downloading the board app…"), file=sys.stderr)
+            BOARD_JS.parent.mkdir(parents=True, exist_ok=True)
+            req = urllib.request.Request(url + "/board.mjs", headers={"User-Agent": f"tiantasks-cli/{VERSION}"})
+            with urllib.request.urlopen(req, timeout=30, context=ssl_context()) as r:
+                BOARD_JS.write_bytes(r.read())
+            stamp.write_text(remote_version)
+    else:
+        ensure_local_server(args.store, args.port)
+        url, token = f"http://127.0.0.1:{args.port}", ""
+    if not script.exists():
+        die("the board app isn't installed; run install.sh from the Tiantasks repo")
+    env = {**os.environ, "TT_URL": url, "TT_TOKEN": token, "TT_PROJECT": current_project(args)}
+    for var in ("CLAUDECODE", "TIANTASKS_AGENT"):
+        env.pop(var, None)
+    os.execve(node, [node, str(script)], env)
+
+
 def cmd_ui(args):
     if isinstance(args.store, RemoteStore):
         print(f"Shared board: {args.store.url}")
@@ -842,20 +1231,7 @@ def cmd_ui(args):
         urllib.request.urlopen(req, timeout=2).read()
         print("stopped")
         return
-    if not server_up(args.port):
-        log = open(args.store.path.parent / "server.log", "a")
-        env = {**os.environ, "TIANTASKS_DB": str(args.store.path)}
-        env.pop("CLAUDECODE", None)  # edits made on the page are yours, not Claude's
-        env.pop("TIANTASKS_ACTOR", None)
-        subprocess.Popen([sys.executable, os.path.realpath(__file__), "serve", "--port", str(args.port)],
-                         stdout=log, stderr=log, stdin=subprocess.DEVNULL, env=env,
-                         start_new_session=True)
-        for _ in range(50):
-            if server_up(args.port):
-                break
-            time.sleep(0.1)
-        else:
-            die(f"server didn't start; see {log.name}")
+    ensure_local_server(args.store, args.port)
     print(f"Tiantasks is running at {url}")
     if not args.no_open:
         webbrowser.open(url)
@@ -889,7 +1265,7 @@ are `claude-<user>` (for example `claude-oliver`), so each person's Claude has i
 | `tt start ID` · `tt stop ID` | Mark in progress / back to open |
 | `tt resolve ID [ID…] -m "what you did"` | Check it off (shown struck through) with a resolution note |
 | `tt assign ID NAME` · `tt comment ID "text"` · `tt edit ID …` · `tt reopen ID` | Housekeeping |
-| `tt show ID` | Full details and history |
+| `tt show ID` | Full details, comments, history and screenshot names (the images themselves are only viewable on the board) |
 
 ## Workflow
 
@@ -907,6 +1283,28 @@ are `claude-<user>` (for example `claude-oliver`), so each person's Claude has i
 
 Keep titles to one line and put details in `-d` or `tt comment`. Use `--json` when you need to
 parse the output.
+
+## Working in an agent team
+
+Several agents can share one board. Each has a name, set when its session starts
+(`TIANTASKS_AGENT=builder-1 claude`); `tt whoami` shows yours.
+
+**Lead agent** (assigns work to others):
+1. `tt brief` shows everything in one read: unassigned work, each agent's queue, what's in
+   progress, what just finished (with notes), and which agents are idle.
+2. Hand out work as self-contained instructions, since the worker only sees the item:
+   `tt add "<task>" --to builder-1 -d "<goal, files involved, how to verify, what 'done' means>"`.
+   Split big jobs into items that don't touch the same files, one per agent.
+3. Follow up with `tt comment ID "..."`, reassign with `tt assign ID NAME`, check results with
+   `tt brief` / `tt show ID`, and add follow-up items when something comes back incomplete.
+
+**Worker agent** (does assigned work):
+1. `tt next --wait --start --timeout 500` waits for the next item assigned to you and claims it.
+   It prints the description and comments (your instructions). If it times out with nothing,
+   run it again.
+2. Do the work, then `tt resolve ID -m "<what you did, where, how you verified it>"`.
+3. If you're blocked, `tt comment ID "blocked: <why>"` and `tt stop ID` so the lead sees it.
+4. Loop back to step 1 until told to stop.
 """
 
 CLAUDE_MD_SNIPPET = """
@@ -1005,9 +1403,11 @@ def build_parser():
     sp.add_argument("--move", metavar="PROJECT", help="move to another project")
     sp.add_argument("--json", action="store_true")
 
-    sp = add_cmd("comment", cmd_comment, "add a comment to an item's history")
+    sp = add_cmd("comment", cmd_comment, "comment on an item, reply to a comment, or delete one (admin)")
     sp.add_argument("id", metavar="ID")
-    sp.add_argument("text", nargs="+")
+    sp.add_argument("text", nargs="*")
+    sp.add_argument("-r", "--reply", metavar="CID", type=int, help="reply to comment CID (see `tt show`)")
+    sp.add_argument("--delete", metavar="CID", type=int, help="delete comment CID (admins only)")
 
     sp = add_cmd("remove", cmd_remove, "delete an item", ("rm",))
     sp.add_argument("id", metavar="ID")
@@ -1024,10 +1424,22 @@ def build_parser():
 
     sp = add_cmd("next", cmd_next, "show the top item assigned to you")
     sp.add_argument("--for", dest="for_", metavar="NAME")
-    sp.add_argument("--start", action="store_true", help="mark it in progress")
+    sp.add_argument("--start", action="store_true", help="claim it and mark it in progress")
     sp.add_argument("--any", action="store_true", help="fall back to unassigned items")
+    sp.add_argument("--wait", action="store_true", help="if there's nothing, wait until something is assigned")
+    sp.add_argument("--timeout", type=int, metavar="SECS", help="with --wait, give up after this long")
+    sp.add_argument("--interval", type=int, metavar="SECS", help="with --wait, how often to check")
     sp.add_argument("-A", "--all-projects", action="store_true")
     sp.add_argument("--json", action="store_true")
+
+    sp = add_cmd("brief", cmd_brief, "board snapshot for a lead agent: unassigned, queued, in progress, done, team")
+    sp.add_argument("-A", "--all-projects", action="store_true")
+    sp.add_argument("--done", type=int, default=10, metavar="N", help="how many recently done items (default 10)")
+    sp.add_argument("--json", action="store_true")
+
+    sp = add_cmd("board", cmd_board, "terminal kanban: open → in progress → done")
+    sp.add_argument("--port", type=int, default=DEFAULT_PORT, help="local board port")
+    sp.add_argument("--update", action="store_true", help="re-download the board app from the shared board")
 
     sp = add_cmd("show", cmd_show, "details and history for one item")
     sp.add_argument("id", metavar="ID")
@@ -1085,6 +1497,7 @@ PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Tiantasks</title>
+<script>try { const t = localStorage.getItem('tt.theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch {}</script>
 <style>
 :root {
   --bg: #f5f4f0; --panel: #ffffff; --ink: #1c1c1e; --muted: #6d6d72; --line: #e3e1db;
@@ -1092,12 +1505,20 @@ PAGE = r"""<!doctype html>
   --warn: #b85a0b; --doing: #fff6e6; --shadow: 0 1px 2px rgba(0,0,0,.04);
 }
 @media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #131315; --panel: #1c1c1f; --ink: #ececef; --muted: #9b9ba3; --line: #2d2d32;
-    --chip: #28282d; --accent: #8198ff; --issue: #ff7070; --task: #62adff; --ok: #5ccf74;
-    --warn: #ffab5c; --doing: #2a2418; --shadow: none;
+  :root:not([data-theme="light"]) {
+    --bg: #111219; --panel: #191a24; --ink: #d4d8f0; --muted: #8189ad; --line: #2a2d40;
+    --chip: #232536; --accent: #8aa4ff; --issue: #ff7a93; --task: #7dcfff; --ok: #9ece6a;
+    --warn: #e5b567; --doing: #221f33; --shadow: none;
   }
 }
+:root[data-theme="dark"] {
+  --bg: #111219; --panel: #191a24; --ink: #d4d8f0; --muted: #8189ad; --line: #2a2d40;
+  --chip: #232536; --accent: #8aa4ff; --issue: #ff7a93; --task: #7dcfff; --ok: #9ece6a;
+  --warn: #e5b567; --doing: #221f33; --shadow: none;
+}
+:root { color-scheme: light dark; }
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink);
   font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
@@ -1127,10 +1548,35 @@ main { max-width: 1320px; margin: 0 auto; padding: 18px 20px 40px; display: grid
 @media (max-width: 720px) { main { grid-template-columns: minmax(0,1fr); padding: 14px 16px 32px; } .bar { padding: 10px 16px; } }
 
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); min-width: 0; }
-form.add { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; padding: 10px; align-items: center; }
-form.add input[name=title] { flex: 1 1 260px; }
-form.add input[name=tags] { width: 130px; }
-form.add input[name=project] { width: 150px; }
+dialog { color: var(--ink); }
+#newDlg { width: min(640px, calc(100vw - 32px)); max-height: calc(100vh - 32px); padding: 0; border: 1px solid var(--line);
+  border-radius: 14px; background: var(--panel); box-shadow: 0 20px 60px rgba(0,0,0,.25); }
+#newDlg::backdrop { background: rgba(0,0,0,.35); }
+#add { display: grid; gap: 14px; padding: 20px; }
+.dlg-head { display: flex; align-items: center; gap: 12px; }
+.dlg-head h2 { margin: 0; font-size: 17px; flex: 1; }
+.fld { display: grid; gap: 5px; font-size: 13px; color: var(--muted); min-width: 0; }
+.fld input, .fld textarea, .fld select { color: var(--ink); width: 100%; }
+.fld textarea { resize: vertical; min-height: 96px; font: inherit; }
+.row4 { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
+.drop { border: 1.5px dashed var(--line); border-radius: 10px; padding: 12px; display: grid; gap: 10px; }
+.drop.over { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.drop p { margin: 0; font-size: 13px; color: var(--muted); }
+.drop .link { font-size: 13px; color: var(--accent); padding: 0; }
+.thumbs { display: flex; flex-wrap: wrap; gap: 8px; }
+.thumbs:empty { display: none; }
+.thumb { position: relative; margin: 0; width: 96px; height: 72px; border-radius: 8px; overflow: hidden;
+  border: 1px solid var(--line); background: var(--chip); }
+.thumb img { width: 100%; height: 100%; object-fit: cover; display: block; cursor: zoom-in; }
+.thumb .x { position: absolute; top: 3px; right: 3px; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 50%;
+  background: rgba(0,0,0,.6); color: #fff; font-size: 13px; line-height: 20px; }
+.err { margin: 0; color: var(--issue); font-size: 13px; }
+.err:empty { display: none; }
+.dlg-foot { display: flex; gap: 8px; align-items: center; justify-content: flex-end; }
+.dlg-foot .kbd { margin-right: auto; font-size: 12px; color: var(--muted); }
+#lightbox { padding: 0; border: 0; background: transparent; max-width: 96vw; max-height: 96vh; }
+#lightbox::backdrop { background: rgba(0,0,0,.75); }
+#lightbox img { display: block; max-width: 96vw; max-height: 92vh; border-radius: 8px; cursor: zoom-out; }
 .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; flex: none; }
 .seg button { border: 0; border-radius: 0; padding: 6px 12px; background: transparent; }
 .seg button.on[data-kind=task] { background: var(--task); color: #fff; }
@@ -1168,6 +1614,24 @@ form.add input[name=project] { width: 150px; }
 .detail .body { white-space: pre-wrap; font-size: 13px; }
 .detail .inline { display: flex; gap: 6px; flex-wrap: wrap; }
 .detail .inline input { flex: 1 1 180px; }
+.comments { display: grid; gap: 8px; }
+.comments h3, .detail h3 { margin: 0; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.thread { display: grid; gap: 6px; }
+.cmt .cacts { float: right; display: flex; gap: 2px; opacity: .6; }
+.cmt:hover .cacts, .cmt:focus-within .cacts { opacity: 1; }
+.cmt.deleted { font-style: italic; color: var(--muted); }
+.fold { justify-self: start; display: flex; align-items: center; gap: 6px; margin-left: 12px; padding: 0 6px 2px 0;
+  border: 0; background: none; color: var(--accent); font-size: 12px; }
+.fold .fline { width: 14px; height: 12px; margin-top: -10px; border-left: 2px solid var(--line);
+  border-bottom: 2px solid var(--line); border-bottom-left-radius: 7px; }
+.fold:hover .fline { border-color: var(--accent); }
+.replies { display: grid; gap: 6px; margin-left: 12px; padding-left: 14px; border-left: 2px solid var(--line); }
+.replybox { margin-left: 26px; }
+.icon { padding: 4px 10px; min-width: 36px; }
+.cmt { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; font-size: 13px; }
+.cmt .by { font-size: 12px; color: var(--muted); margin-bottom: 2px; }
+.cmt .by b { color: var(--ink); font-weight: 600; }
+.cmt .txt { white-space: pre-wrap; overflow-wrap: anywhere; }
 .hist { font-size: 12px; color: var(--muted); display: grid; gap: 3px; max-height: 220px; overflow: auto; }
 .hist b { color: var(--ink); font-weight: 600; }
 
@@ -1195,26 +1659,11 @@ code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; background: va
   <span class="spacer"></span>
   <span class="stats" id="stats"></span>
   <span class="stats" id="acct"></span>
+  <button class="icon" id="themeBtn" title="Theme" aria-label="Theme"></button>
+  <button class="primary" id="newBtn" title="Add a task or issue (N)">+ Add</button>
 </div></header>
 
 <main>
-  <form class="add card" id="add" autocomplete="off">
-    <div class="seg" role="group" aria-label="Kind">
-      <button type="button" data-kind="task" class="on">Task</button>
-      <button type="button" data-kind="issue">Issue</button>
-    </div>
-    <input name="title" placeholder="Add a task… (press Enter)" aria-label="Title" required>
-    <select name="priority" aria-label="Priority">
-      <option value="">No priority</option><option value="crit">crit</option><option value="high">high</option>
-      <option value="med">med</option><option value="low">low</option>
-    </select>
-    <select name="assignee" aria-label="Assignee"></select>
-    <input name="tags" placeholder="tags" aria-label="Tags">
-    <input name="project" placeholder="project" aria-label="Project" list="projList" required>
-    <datalist id="projList"></datalist>
-    <button class="primary">Add</button>
-  </form>
-
   <section class="card" id="qIssue"></section>
   <section class="card" id="qTask"></section>
 
@@ -1226,6 +1675,43 @@ code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; background: va
       “work through your Tiantasks queue”.</div>
   </aside>
 </main>
+
+<dialog id="newDlg" aria-labelledby="newTitle">
+  <form id="add" autocomplete="off" novalidate>
+    <div class="dlg-head">
+      <h2 id="newTitle">New task</h2>
+      <div class="seg" role="group" aria-label="Kind">
+        <button type="button" data-kind="task" class="on">Task</button>
+        <button type="button" data-kind="issue">Issue</button>
+      </div>
+    </div>
+    <label class="fld">Title <input name="title" maxlength="300" placeholder="What needs doing?"></label>
+    <label class="fld">Description <textarea name="body" rows="5" placeholder="Details, steps to reproduce, links…"></textarea></label>
+    <div class="fld">Screenshots
+      <div class="drop" id="drop">
+        <div class="thumbs" id="shots"></div>
+        <p>Paste with ⌘V, drag images here, or <button type="button" class="link" id="pick">choose files</button></p>
+      </div>
+    </div>
+    <div class="row4">
+      <label class="fld">Priority
+        <select name="priority"><option value="">None</option><option value="crit">crit</option>
+          <option value="high">high</option><option value="med">med</option><option value="low">low</option></select></label>
+      <label class="fld">Assignee <select name="assignee"></select></label>
+      <label class="fld">Tags <input name="tags" placeholder="ui, auth"></label>
+      <label class="fld">Project <input name="project" list="projList"></label>
+    </div>
+    <datalist id="projList"></datalist>
+    <p class="err" id="addErr" role="alert"></p>
+    <div class="dlg-foot">
+      <span class="kbd">⌘↵ to add · Esc to cancel</span>
+      <button type="button" id="cancel">Cancel</button>
+      <button type="submit" class="primary" id="submit">Add task</button>
+    </div>
+  </form>
+</dialog>
+<dialog id="lightbox" aria-label="Screenshot"><img alt=""></dialog>
+<input type="file" id="filePick" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
 
 <script>
 const $ = (s, el = document) => el.querySelector(s);
@@ -1240,11 +1726,15 @@ let S = null, lastText = '', kind = 'task';
 let project = saved.get('project', ''), who = saved.get('who', '');
 const expanded = new Set();
 
-async function api(method, path, body) {
+async function api(method, path, body, quiet) {
   const r = await fetch(path, {method, headers: {'Content-Type': 'application/json', 'X-Tiantasks': '1'},
     body: body ? JSON.stringify(body) : undefined});
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) { alert(data.error || ('Error ' + r.status)); throw new Error(data.error); }
+  if (!r.ok) {
+    const msg = data.error || ('Error ' + r.status);
+    if (!quiet) alert(msg);
+    throw new Error(msg);
+  }
   return data;
 }
 
@@ -1252,6 +1742,43 @@ function typing() {
   const a = document.activeElement;
   return a && a.closest && a.closest('.item') && (a.tagName === 'INPUT' || a.tagName === 'SELECT');
 }
+
+// ---- screenshots: shrink big images in the browser so each fits the database's ~2 MB limit
+const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+const MAX_BYTES = 1900000;
+const EXT = {'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif'};
+const canvasBlob = (c, type, q) => new Promise(r => c.toBlob(r, type, q));
+
+async function prepareImage(file) {
+  let bmp;
+  try { bmp = await createImageBitmap(file); }
+  catch { throw new Error(`${file.name || 'That file'} isn't an image this browser can read.`); }
+  const longest = Math.max(bmp.width, bmp.height);
+  if (IMAGE_TYPES.includes(file.type) && longest <= 1920 && file.size <= 600000) return file;
+  const scale = Math.min(1, 1920 / longest);
+  const c = document.createElement('canvas');
+  c.width = Math.round(bmp.width * scale); c.height = Math.round(bmp.height * scale);
+  const g = c.getContext('2d');
+  g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height);
+  g.drawImage(bmp, 0, 0, c.width, c.height);
+  for (const q of [0.9, 0.8, 0.65, 0.5, 0.35]) {
+    let b = await canvasBlob(c, 'image/webp', q);
+    if (!b || b.type !== 'image/webp') b = await canvasBlob(c, 'image/jpeg', q);  // Safari can't encode WebP
+    if (b && b.size <= MAX_BYTES) return b;
+  }
+  throw new Error(`${file.name || 'That image'} is too large, even after shrinking it.`);
+}
+
+async function uploadImage(itemId, file) {
+  const blob = await prepareImage(file);
+  const base = (file.name || `screenshot-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}`).replace(/\.[^.]+$/, '');
+  const name = `${base}.${EXT[blob.type] || 'png'}`;
+  const r = await fetch(`/api/items/${itemId}/attachments?name=${encodeURIComponent(name)}`,
+    {method: 'POST', headers: {'Content-Type': blob.type, 'X-Tiantasks': '1'}, body: blob});
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `Upload failed (${r.status})`);
+}
+
+const imagesFrom = list => [...(list || [])].filter(f => f.type.startsWith('image/'));
 
 // Every write bumps a version number, so polling it is one tiny query. The full board is
 // only fetched when something changed, and nothing is polled while the tab is hidden.
@@ -1306,6 +1833,8 @@ function itemHTML(it) {
   if (it.priority) meta.push(`<span class="pill p-${it.priority}">${it.priority}</span>`);
   if (!project) meta.push(`<span class="pill">${esc(it.project)}</span>`);
   it.tags.forEach(t => meta.push(`<span class="pill">#${esc(t)}</span>`));
+  const shots = it.attachments || [];
+  if (shots.length) meta.push(`<span class="pill" title="${shots.length} screenshot${shots.length > 1 ? 's' : ''}">📎 ${shots.length}</span>`);
   if (done) {
     if (it.assignee) meta.push(`<span class="pill who">@${esc(it.assignee)}</span>`);
     meta.push(`<span class="pill">resolved ${ago(it.resolved_at)}</span>`);
@@ -1319,10 +1848,18 @@ function itemHTML(it) {
   if (expanded.has(it.id)) {
     detail = `<div class="detail">
       ${it.body ? `<div class="body">${esc(it.body)}</div>` : ''}
-      ${done ? '' : `<div class="inline"><input data-f="note" placeholder="Resolution note (optional)">
+      <div class="thumbs">${shots.map(a => `<figure class="thumb">
+        <img src="/api/attachments/${a.id}" alt="${esc(a.name)}" title="${esc(a.name)}" loading="lazy" data-act="zoom">
+        <button class="x" data-act="delShot" data-att="${a.id}" aria-label="Remove ${esc(a.name)}" title="Remove">×</button></figure>`).join('')}</div>
+      <div><button class="link" data-act="addShots">+ Add screenshots</button>
+        <span class="count">(or paste one while this item is open)</span></div>
+      <div class="comments"><h3>Comments</h3><div class="comments" id="cm-${it.id}"></div>
+        <div class="inline"><input data-f="comment" placeholder="Write a comment… (Enter to post)" aria-label="Comment">
+          <button data-act="comment">Comment</button></div></div>
+      ${done ? '' : `<div class="inline"><input data-f="note" placeholder="Resolution note (optional, Enter to resolve)" aria-label="Resolution note">
         <button data-act="resolveNote">Resolve</button></div>`}
-      <div class="inline"><select data-act="priority" aria-label="Priority">${options([['', 'No priority'], ...Object.keys(PR).map(p => [p, p])], it.priority)}</select>
-        <input data-f="comment" placeholder="Add a comment"><button data-act="comment">Comment</button></div>
+      <div class="inline"><select data-act="priority" aria-label="Priority">${options([['', 'No priority'], ...Object.keys(PR).map(p => [p, p])], it.priority)}</select></div>
+      <h3>History</h3>
       <div class="hist" id="hist-${it.id}">Loading history…</div>
       <div><button class="link danger" data-act="delete">Delete ${it.ref}</button></div>
     </div>`;
@@ -1340,10 +1877,53 @@ function itemHTML(it) {
   </div>`;
 }
 
+const COMMENT_ACTIONS = ['commented', 'added a comment', 'replied', 'deleted a comment'];
+const openThreads = new Set();   // top-level comment ids whose replies are expanded
+const replyingTo = new Map();    // item id -> comment id being replied to
+let focusReply = false;
+
+function commentHTML(c, isReply) {
+  if (c.deleted) return `<div class="cmt deleted">${isReply ? 'Reply' : 'Comment'} deleted</div>`;
+  return `<div class="cmt" data-cid="${c.id}">
+    <div class="by"><b>${esc(c.author)}</b> · ${ago(c.at)}
+      <span class="cacts"><button class="link" data-act="reply" data-cid="${c.parent_id || c.id}">Reply</button>${
+        S.admin ? `<button class="link danger" data-act="delComment" data-cid="${c.id}">Delete</button>` : ''}</span></div>
+    <div class="txt">${esc(c.body)}</div></div>`;
+}
+
+function threadsHTML(itemId, comments) {
+  const kids = {};
+  comments.filter(c => c.parent_id).forEach(c => (kids[c.parent_id] ||= []).push(c));
+  const tops = comments.filter(c => !c.parent_id && !(c.deleted && !(kids[c.id] || []).length));
+  if (!tops.length) return '<div class="count">No comments yet.</div>';
+  return tops.map(c => {
+    const replies = kids[c.id] || [];
+    const open = openThreads.has(c.id);
+    const n = `${replies.length} ${replies.length === 1 ? 'reply' : 'replies'}`;
+    return `<div class="thread">${commentHTML(c)}
+      ${replies.length ? `<button class="fold" data-act="fold" data-cid="${c.id}" aria-expanded="${open}">
+        <span class="fline"></span>${open ? `Hide ${n}` : n} ${open ? '▾' : '▸'}</button>` : ''}
+      ${replies.length && open ? `<div class="replies">${replies.map(r => commentHTML(r, true)).join('')}</div>` : ''}
+      ${replyingTo.get(itemId) === c.id ? `<div class="inline replybox">
+        <input data-f="reply" data-parent="${c.id}" placeholder="Reply to ${esc(c.deleted ? 'thread' : c.author)}… (Enter to post)" aria-label="Reply">
+        <button data-act="sendReply" data-cid="${c.id}">Reply</button><button class="link" data-act="cancelReply">Cancel</button></div>` : ''}
+    </div>`;
+  }).join('');
+}
+
 async function loadHistory(id) {
-  const evs = await fetch(`/api/items/${id}/events`).then(r => r.json());
-  const el = document.getElementById('hist-' + id);
-  if (el) el.innerHTML = evs.map(e => `<div>${ago(e.at)} · <b>${esc(e.actor)}</b> ${esc(e.action)}${e.detail ? ': ' + esc(e.detail) : ''}</div>`).join('');
+  const ref = S.items.find(i => i.id === id)?.ref || id;
+  const [evs, comments] = await Promise.all([
+    fetch(`/api/items/${id}/events`).then(r => r.json()),
+    fetch(`/api/items/${ref}/comments`).then(r => (r.ok ? r.json() : [])),
+  ]);
+  const el = document.getElementById('hist-' + id), cm = document.getElementById('cm-' + id);
+  if (cm) {
+    cm.innerHTML = threadsHTML(id, comments);
+    if (focusReply) { focusReply = false; const r = cm.querySelector('[data-f=reply]'); if (r) r.focus(); }
+  }
+  if (el) el.innerHTML = evs.filter(e => !COMMENT_ACTIONS.includes(e.action))
+    .map(e => `<div>${ago(e.at)} · <b>${esc(e.actor)}</b> ${esc(e.action)}${e.detail ? ': ' + esc(e.detail) : ''}</div>`).join('');
 }
 
 function queueHTML(title, color, items, emptyMsg) {
@@ -1362,9 +1942,6 @@ function render() {
   $('#fProject').innerHTML = options([['', 'All projects'], ...projects], project);
   $('#fWho').innerHTML = options([['', 'Anyone'], ['__none', 'Unassigned'], ...S.assignees.map(n => [n, n === S.me ? `${n} (you)` : n])], who);
   $('#projList').innerHTML = S.projects.map(p => `<option value="${esc(p.project)}">`).join('');
-  const f = $('#add');
-  f.assignee.innerHTML = assigneeOptions(f.assignee.value);
-  if (!f.project.value) f.project.value = project || (S.projects[0] && S.projects[0].project) || 'general';
 
   let items = S.items;
   if (who === '__none') items = items.filter(i => !i.assignee);
@@ -1392,6 +1969,24 @@ document.addEventListener('click', async e => {
   if (!it) return;
   const act = el.dataset.act;
   if (act === 'expand') { expanded.has(id) ? expanded.delete(id) : expanded.add(id); render(); return; }
+  if (act === 'fold') { const c = +el.dataset.cid; openThreads.has(c) ? openThreads.delete(c) : openThreads.add(c); return loadHistory(id); }
+  if (act === 'reply') { replyingTo.set(id, +el.dataset.cid); openThreads.add(+el.dataset.cid); focusReply = true; return loadHistory(id); }
+  if (act === 'cancelReply') { replyingTo.delete(id); return loadHistory(id); }
+  if (act === 'sendReply') {
+    const v = $('[data-f=reply]', item).value.trim(); if (!v) return;
+    await api('POST', `/api/items/${id}/comment`, {text: v, parent_id: +el.dataset.cid});
+    replyingTo.delete(id); openThreads.add(+el.dataset.cid);
+  }
+  if (act === 'delComment') {
+    if (!confirm('Delete this comment for everyone? Replies to it stay.')) return;
+    await api('DELETE', `/api/comments/${el.dataset.cid}`);
+  }
+  if (act === 'zoom') { $('#lightbox img').src = el.src; $('#lightbox img').alt = el.alt; $('#lightbox').showModal(); return; }
+  if (act === 'addShots') { pickTarget = id; $('#filePick').click(); return; }
+  if (act === 'delShot') {
+    if (!confirm('Remove this screenshot?')) return;
+    await api('DELETE', `/api/attachments/${el.dataset.att}`);
+  }
   if (act === 'toggle') await api('PATCH', `/api/items/${id}`, {status: it.status === 'done' ? 'open' : 'done'});
   if (act === 'start') await api('PATCH', `/api/items/${id}`, {status: 'doing', ...(it.assignee ? {} : {assignee: S.me})});
   if (act === 'pause') await api('PATCH', `/api/items/${id}`, {status: 'open'});
@@ -1403,7 +1998,7 @@ document.addEventListener('click', async e => {
 
 document.addEventListener('change', async e => {
   const el = e.target;
-  if (el.id === 'fProject') { project = el.value; saved.set('project', project); if (project) $('#add').project.value = project; return refresh(true); }
+  if (el.id === 'fProject') { project = el.value; saved.set('project', project); return refresh(true); }
   if (el.id === 'fWho') { who = el.value; saved.set('who', who); return render(); }
   const item = el.closest('.item'); if (!item) return;
   if (el.dataset.act === 'assign') await api('PATCH', `/api/items/${item.dataset.id}`, {assignee: el.value});
@@ -1415,21 +2010,144 @@ document.addEventListener('toggle', e => {
   if (e.target.matches && e.target.matches('details.resolved')) saved.set('open.' + e.target.dataset.q, e.target.open ? '1' : '0');
 }, true);
 
-document.querySelectorAll('.seg button').forEach(b => b.addEventListener('click', () => {
-  kind = b.dataset.kind;
-  document.querySelectorAll('.seg button').forEach(x => x.classList.toggle('on', x === b));
-  $('#add').title.placeholder = `Add ${kind === 'task' ? 'a task' : 'an issue'}… (press Enter)`;
-  $('#add').title.focus();
-}));
+// ---- "+ Add" dialog
+const dlg = $('#newDlg'), form = $('#add');
+let pending = [];          // screenshots waiting to be uploaded with the new item
+let pickTarget = null;     // null = the dialog; otherwise the id of an open item
 
-$('#add').addEventListener('submit', async e => {
-  e.preventDefault();
-  const f = e.target;
-  await api('POST', '/api/items', {kind, title: f.title.value, priority: f.priority.value,
-    assignee: f.assignee.value, tags: f.tags.value, project: f.project.value.trim()});
-  f.title.value = ''; f.tags.value = ''; f.title.focus();
-  refresh(true);
+function setKind(k) {
+  kind = k;
+  document.querySelectorAll('.seg button').forEach(x => x.classList.toggle('on', x.dataset.kind === k));
+  $('#newTitle').textContent = k === 'task' ? 'New task' : 'New issue';
+  $('#submit').textContent = k === 'task' ? 'Add task' : 'Add issue';
+  form.title.placeholder = k === 'task' ? 'What needs doing?' : "What's wrong?";
+}
+
+function renderPending() {
+  $('#shots').innerHTML = pending.map((p, i) => `<figure class="thumb"><img src="${p.url}" alt="${esc(p.file.name || 'screenshot')}">
+    <button type="button" class="x" data-rm="${i}" aria-label="Remove">×</button></figure>`).join('');
+}
+
+function addPending(files) {
+  for (const f of imagesFrom(files)) pending.push({file: f, url: URL.createObjectURL(f)});
+  renderPending();
+}
+
+function clearPending() {
+  pending.forEach(p => URL.revokeObjectURL(p.url));
+  pending = []; renderPending();
+}
+
+function openNew() {
+  if (!S || dlg.open) return;
+  form.reset(); clearPending(); setKind(kind);
+  $('#addErr').textContent = '';
+  form.assignee.innerHTML = assigneeOptions('');
+  form.project.value = project || (S.projects[0] && S.projects[0].project) || 'general';
+  $('#submit').disabled = false;
+  dlg.showModal();
+  form.title.focus();
+}
+
+$('#newBtn').addEventListener('click', openNew);
+$('#cancel').addEventListener('click', () => dlg.close());
+dlg.addEventListener('close', clearPending);
+document.querySelectorAll('.seg button').forEach(b => b.addEventListener('click', () => { setKind(b.dataset.kind); form.title.focus(); }));
+$('#shots').addEventListener('click', e => {
+  const b = e.target.closest('[data-rm]'); if (!b) return;
+  URL.revokeObjectURL(pending[+b.dataset.rm].url); pending.splice(+b.dataset.rm, 1); renderPending();
 });
+$('#pick').addEventListener('click', () => { pickTarget = null; $('#filePick').click(); });
+$('#lightbox').addEventListener('click', () => $('#lightbox').close());
+
+const drop = $('#drop');
+drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('over'); addPending(e.dataTransfer.files); });
+
+async function uploadToItem(id, files) {
+  try { for (const f of imagesFrom(files)) await uploadImage(id, f); }
+  catch (err) { alert(err.message); }
+  refresh(true);
+}
+
+$('#filePick').addEventListener('change', e => {
+  const files = [...e.target.files]; e.target.value = '';
+  if (pickTarget === null) addPending(files); else uploadToItem(pickTarget, files);
+});
+
+// Paste a screenshot into the dialog, or into whichever item's details are open.
+document.addEventListener('paste', e => {
+  const files = imagesFrom(e.clipboardData && e.clipboardData.files);
+  if (!files.length) return;
+  if (dlg.open) { e.preventDefault(); addPending(files); return; }
+  const open = [...expanded];
+  const focused = document.activeElement && document.activeElement.closest && document.activeElement.closest('.item');
+  const target = focused ? +focused.dataset.id : (open.length === 1 ? open[0] : null);
+  if (target) { e.preventDefault(); uploadToItem(target, files); }
+});
+
+document.addEventListener('keydown', e => {
+  if (dlg.open && e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); form.requestSubmit(); return; }
+  // Enter in an item's comment / resolution-note box does the same as its button.
+  const f = e.target && e.target.dataset && e.target.dataset.f;
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && (f === 'comment' || f === 'note' || f === 'reply')) {
+    e.preventDefault();
+    const sel = {comment: '[data-act=comment]', note: '[data-act=resolveNote]', reply: '[data-act=sendReply]'}[f];
+    const btn = (f === 'reply' ? e.target.closest('.replybox') : e.target.closest('.item')).querySelector(sel);
+    if (btn) btn.click();
+    return;
+  }
+  const t = e.target;
+  const inField = t && (t.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName));
+  if (!inField && !dlg.open && !e.metaKey && !e.ctrlKey && !e.altKey && e.key.toLowerCase() === 'n') { e.preventDefault(); openNew(); }
+});
+
+form.addEventListener('submit', async e => {
+  e.preventDefault();
+  const btn = $('#submit');
+  if (btn.disabled) return;
+  const title = form.title.value.trim();
+  if (!title) { $('#addErr').textContent = 'Give it a title.'; form.title.focus(); return; }
+  btn.disabled = true; $('#addErr').textContent = '';
+  let created = null;
+  try {
+    btn.textContent = 'Adding…';
+    created = await api('POST', '/api/items', {kind, title, body: form.body.value, priority: form.priority.value,
+      assignee: form.assignee.value, tags: form.tags.value, project: form.project.value.trim()}, true);
+    for (let i = 0; i < pending.length; i++) {
+      btn.textContent = `Uploading ${i + 1} of ${pending.length}…`;
+      await uploadImage(created.id, pending[i].file);
+    }
+    dlg.close();
+  } catch (err) {
+    if (created) {  // the item exists; don't let a retry create a duplicate
+      dlg.close();
+      alert(`Added ${created.ref}, but a screenshot didn't upload: ${err.message} Open ${created.ref} to try again.`);
+    } else {
+      $('#addErr').textContent = err.message;
+    }
+  } finally {
+    btn.disabled = false; setKind(kind);
+    refresh(true);
+  }
+});
+
+// ---- theme: Auto (follows the system) → Dark → Light
+const THEMES = [['auto', '◐', 'Theme: auto (follows your system)'], ['dark', '☾', 'Theme: dark'], ['light', '☀', 'Theme: light']];
+function showTheme() {
+  const cur = document.documentElement.dataset.theme || 'auto';
+  const [, icon, label] = THEMES.find(t => t[0] === cur);
+  $('#themeBtn').textContent = icon; $('#themeBtn').title = label + ' · click to change';
+}
+$('#themeBtn').addEventListener('click', () => {
+  const cur = document.documentElement.dataset.theme || 'auto';
+  const next = THEMES[(THEMES.findIndex(t => t[0] === cur) + 1) % THEMES.length][0];
+  if (next === 'auto') delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = next;
+  saved.set('theme', next === 'auto' ? '' : next);
+  showTheme();
+});
+showTheme();
 
 setInterval(tick, 4000);
 setInterval(() => { if (S && !document.hidden && !typing()) render(); }, 60000);  // keep "5m ago" fresh
