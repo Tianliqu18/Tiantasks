@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""Manage who can sign in to the shared Tiantasks board.
+
+  ./tokens list            who has access
+  ./tokens add NAME        give someone access (prints their token and copies it)
+  ./tokens copy NAME       copy someone's existing token to the clipboard
+  ./tokens reset NAME      replace someone's token (their old one stops working)
+  ./tokens remove NAME     take away someone's access
+
+Tokens are kept in users.json next to this script (readable only by your Mac account)
+and in the board's TIANTASKS_USERS secret on Cloudflare. This script keeps them in sync.
+"""
+
+import json
+import os
+import re
+import secrets
+import ssl
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+STORE = HERE / "users.json"
+TT_CONFIG = Path.home() / ".tiantasks" / "config.json"
+
+
+def die(msg):
+    sys.exit(f"tokens: {msg}")
+
+
+def save(data):
+    STORE.touch(mode=0o600)
+    os.chmod(STORE, 0o600)
+    STORE.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def whose(url, token):
+    """Ask the board which user a token belongs to (None if it isn't valid)."""
+    ctx = ssl.create_default_context()
+    if os.path.exists("/etc/ssl/cert.pem"):
+        ctx.load_verify_locations("/etc/ssl/cert.pem")
+    req = urllib.request.Request(f"{url}/api/me", headers={
+        "Authorization": f"Bearer {token}", "User-Agent": "tiantasks-tokens"})
+    try:
+        with urllib.request.urlopen(req, timeout=15, context=ctx) as r:
+            return json.load(r)["user"]
+    except Exception:
+        return None
+
+
+def load():
+    if STORE.exists():
+        return json.loads(STORE.read_text())
+    # First run: rebuild the list from the tokens already on this Mac.
+    try:
+        cfg = json.loads(TT_CONFIG.read_text())
+    except (OSError, ValueError):
+        die("no users.json yet and `tt` isn't signed in to the board; run ./deploy.sh first")
+    data = {"url": cfg["url"], "users": {}}
+    found = [cfg["token"]]
+    if (HERE / "oliver-token.txt").exists():
+        found.append((HERE / "oliver-token.txt").read_text().strip())
+    for token in found:
+        name = whose(data["url"], token)
+        if name:
+            data["users"][name] = token
+    save(data)
+    print(f"Set up users.json from the tokens on this Mac: {', '.join(data['users']) or 'none'}")
+    return data
+
+
+def push(data):
+    """Replace the board's login list on Cloudflare."""
+    if not data["users"]:
+        die("refusing to remove the last user")
+    spec = ",".join(f"{n}:{t}" for n, t in sorted(data["users"].items()))
+    r = subprocess.run(["npx", "--no-install", "wrangler", "secret", "put", "TIANTASKS_USERS"],
+                       input=spec, text=True, capture_output=True, cwd=HERE)
+    if r.returncode != 0:
+        die(f"couldn't update Cloudflare:\n{r.stderr or r.stdout}")
+    save(data)
+
+
+def sync_tt(data, name):
+    """If you just changed your own token, keep your `tt` signed in."""
+    try:
+        cfg = json.loads(TT_CONFIG.read_text())
+    except (OSError, ValueError):
+        return
+    if cfg.get("url") == data["url"] and whose(data["url"], cfg["token"]) in (None, name):
+        if name in data["users"]:
+            cfg["token"] = data["users"][name]
+            TT_CONFIG.write_text(json.dumps(cfg, indent=2))
+            print("Updated your `tt` sign-in to the new token.")
+
+
+def copy(token):
+    try:
+        subprocess.run(["pbcopy"], input=token, text=True, check=True)
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    cmd, name = args[0], (args[1].lower() if len(args) > 1 else None)
+    data = load()
+    users = data["users"]
+
+    if cmd == "list":
+        print(f"Board: {data['url']}")
+        for n in sorted(users):
+            print(f"  {n}  (their Claude is claude-{n})")
+        return
+    if not name:
+        die(f"usage: ./tokens {cmd} NAME")
+    if not re.fullmatch(r"[a-z0-9_.]+", name):
+        die("names can only use lowercase letters, numbers, _ and .")
+
+    if cmd == "copy":
+        if name not in users:
+            die(f"{name} doesn't have access (./tokens add {name})")
+        print(f"Copied {name}'s token to the clipboard." if copy(users[name]) else users[name])
+    elif cmd in ("add", "reset"):
+        if cmd == "add" and name in users:
+            die(f"{name} already has access; use ./tokens copy {name} or ./tokens reset {name}")
+        if cmd == "reset" and name not in users:
+            die(f"{name} doesn't have access (./tokens add {name})")
+        users[name] = secrets.token_urlsafe(24)
+        push(data)
+        sync_tt(data, name)
+        print(f"{'Added' if cmd == 'add' else 'New token for'} {name}. It works within a few seconds.")
+        print(f"\n  Token: {users[name]}")
+        if copy(users[name]):
+            print("  (also copied to the clipboard)")
+        print(f"\nSend it privately. They sign in at {data['url']}, or set up the CLI with:")
+        print(f"  curl -fsSL {data['url']}/tiantasks -o /opt/homebrew/bin/tt && chmod +x /opt/homebrew/bin/tt")
+        print(f"  tt login {data['url']}")
+        print("  tt claude-setup")
+    elif cmd == "remove":
+        if name not in users:
+            die(f"{name} doesn't have access")
+        del users[name]
+        push(data)
+        print(f"Removed {name}. Their token stops working within a few seconds.")
+    else:
+        die(f"unknown command '{cmd}' (try ./tokens help)")
+
+
+if __name__ == "__main__":
+    main()

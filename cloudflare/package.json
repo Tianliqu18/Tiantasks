@@ -1,0 +1,12 @@
+{
+  "name": "tiantasks-board",
+  "private": true,
+  "scripts": {
+    "build": "./build.sh",
+    "dev": "./build.sh && wrangler d1 execute tiantasks --local --file schema.sql && wrangler dev",
+    "deploy": "./deploy.sh"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}

@@ -1,0 +1,1483 @@
+#!/usr/bin/env python3
+"""Tiantasks: task and issue queues with a live local web page and a CLI.
+
+Everything lives in one SQLite database (~/.tiantasks/tiantasks.db), so there
+is nothing to stage or commit. `tt ui` serves the page; every other command
+reads and writes the same database, which is how Claude Code picks up,
+reports and closes work.
+"""
+
+import argparse
+import datetime as dt
+import getpass
+import hmac
+import json
+import os
+import re
+import sqlite3
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import webbrowser
+from contextlib import contextmanager
+from http.cookies import SimpleCookie
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, quote, urlencode, urlparse
+
+VERSION = "2.2.1"
+DEFAULT_DB = Path.home() / ".tiantasks" / "tiantasks.db"
+CONFIG = Path.home() / ".tiantasks" / "config.json"
+DEFAULT_PORT = int(os.environ.get("TIANTASKS_PORT", 7777))
+PRIORITIES = ("crit", "high", "med", "low")
+PRANK = {p: i for i, p in enumerate(PRIORITIES)}
+STATUSES = ("open", "doing", "done")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS items (
+  id          INTEGER PRIMARY KEY,
+  kind        TEXT NOT NULL CHECK (kind IN ('task', 'issue')),
+  num         INTEGER NOT NULL,
+  project     TEXT NOT NULL,
+  title       TEXT NOT NULL,
+  body        TEXT NOT NULL DEFAULT '',
+  status      TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'doing', 'done')),
+  priority    TEXT NOT NULL DEFAULT '',
+  tags        TEXT NOT NULL DEFAULT '[]',
+  assignee    TEXT NOT NULL DEFAULT '',
+  note        TEXT NOT NULL DEFAULT '',
+  created_by  TEXT NOT NULL DEFAULT '',
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL,
+  resolved_at TEXT,
+  UNIQUE (kind, num)
+);
+CREATE TABLE IF NOT EXISTS events (
+  id      INTEGER PRIMARY KEY,
+  item_id INTEGER NOT NULL,
+  ref     TEXT NOT NULL,
+  title   TEXT NOT NULL,
+  project TEXT NOT NULL,
+  at      TEXT NOT NULL,
+  actor   TEXT NOT NULL,
+  action  TEXT NOT NULL,
+  detail  TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS events_item ON events (item_id);
+"""
+
+
+class TTError(Exception):
+    def __init__(self, msg, status=400):
+        super().__init__(msg)
+        self.status = status
+
+
+def now_iso():
+    return dt.datetime.now().isoformat(timespec="seconds")
+
+
+def sort_key(it):
+    return (0 if it["status"] == "doing" else 1, PRANK.get(it["priority"], 9), it["created_at"])
+
+
+def parse_ref(ref):
+    if isinstance(ref, int) or str(ref).isdigit():
+        return None, int(ref)
+    m = re.fullmatch(r"#?([TtIi])-?(\d+)", str(ref).strip())
+    if not m:
+        raise TTError(f"'{ref}' is not a valid id (expected something like T-3 or I-12)")
+    return ("task" if m.group(1).upper() == "T" else "issue"), int(m.group(2))
+
+
+def clean_tags(tags):
+    if isinstance(tags, str):
+        tags = re.split(r"[,\s]+", tags)
+    return [t.lstrip("#").strip() for t in tags if t and t.lstrip("#").strip()]
+
+
+# ---------------------------------------------------------------- store
+
+class Store:
+    def __init__(self, path=None):
+        self.path = Path(path or os.environ.get("TIANTASKS_DB") or DEFAULT_DB).expanduser()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(self.path, timeout=15, isolation_level=None,
+                                  check_same_thread=False)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.executescript(SCHEMA)
+
+    def close(self):
+        self.db.close()
+
+    @contextmanager
+    def tx(self):
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+        self.db.execute("COMMIT")
+
+    @staticmethod
+    def _row(r):
+        d = dict(r)
+        d["tags"] = json.loads(d["tags"])
+        d["ref"] = f"{'T' if d['kind'] == 'task' else 'I'}-{d['num']}"
+        return d
+
+    def get(self, ref):
+        kind, num = parse_ref(ref)
+        if kind is None:
+            r = self.db.execute("SELECT * FROM items WHERE id=?", (num,)).fetchone()
+        else:
+            r = self.db.execute("SELECT * FROM items WHERE kind=? AND num=?", (kind, num)).fetchone()
+        if not r:
+            raise TTError(f"no item {ref}", 404)
+        return self._row(r)
+
+    def _log(self, item, actor, action, detail=""):
+        self.db.execute(
+            "INSERT INTO events (item_id, ref, title, project, at, actor, action, detail)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (item["id"], item["ref"], item["title"], item["project"], now_iso(), actor, action, detail))
+
+    def create(self, kind, title, project, actor, body="", priority="", tags=(), assignee=""):
+        title = " ".join(str(title).split())
+        if not title:
+            raise TTError("title cannot be empty")
+        if kind not in ("task", "issue"):
+            raise TTError("kind must be task or issue")
+        if priority and priority not in PRIORITIES:
+            raise TTError(f"priority must be one of {', '.join(PRIORITIES)}")
+        now = now_iso()
+        with self.tx():
+            num = self.db.execute("SELECT COALESCE(MAX(num), 0) + 1 FROM items WHERE kind=?",
+                                  (kind,)).fetchone()[0]
+            cur = self.db.execute(
+                "INSERT INTO items (kind, num, project, title, body, priority, tags, assignee,"
+                " created_by, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (kind, num, project or "general", title, body or "", priority or "",
+                 json.dumps(clean_tags(tags)), assignee or "", actor, now, now))
+            item = self.get(cur.lastrowid)
+            self._log(item, actor, "opened", f"for {assignee}" if assignee else "")
+        return item
+
+    def update(self, ref, actor, **ch):
+        with self.tx():
+            it = self.get(ref)
+            sets, events = {}, []
+            status = ch.get("status")
+            note = ch.get("note")
+            if status and status != it["status"]:
+                if status not in STATUSES:
+                    raise TTError(f"status must be one of {', '.join(STATUSES)}")
+                sets["status"] = status
+                if status == "done":
+                    sets["resolved_at"] = now_iso()
+                    sets["note"] = (note or "").strip()
+                    events.append(("resolved", sets["note"]))
+                    note = None
+                elif it["status"] == "done":
+                    sets["resolved_at"], sets["note"] = None, ""
+                    events.append(("reopened", ""))
+                    if status == "doing":
+                        events.append(("started", ""))
+                else:
+                    events.append(("started" if status == "doing" else "paused", ""))
+            if note is not None and note.strip() != it["note"]:
+                sets["note"] = note.strip()
+                events.append(("noted", note.strip()))
+            if "assignee" in ch and (ch["assignee"] or "") != it["assignee"]:
+                sets["assignee"] = ch["assignee"] or ""
+                events.append(("assigned", f"to {ch['assignee']}" if ch["assignee"] else "to nobody"))
+            if "priority" in ch and (ch["priority"] or "") != it["priority"]:
+                p = ch["priority"] or ""
+                if p and p not in PRIORITIES:
+                    raise TTError(f"priority must be one of {', '.join(PRIORITIES)}")
+                sets["priority"] = p
+                events.append(("reprioritized", p or "none"))
+            if "title" in ch and ch["title"] and " ".join(ch["title"].split()) != it["title"]:
+                sets["title"] = " ".join(ch["title"].split())
+                events.append(("renamed", f"from “{it['title']}”"))
+            if "body" in ch and (ch["body"] or "") != it["body"]:
+                sets["body"] = ch["body"] or ""
+                events.append(("edited", "description"))
+            if "tags" in ch and clean_tags(ch["tags"]) != it["tags"]:
+                sets["tags"] = json.dumps(clean_tags(ch["tags"]))
+                events.append(("tagged", ", ".join(clean_tags(ch["tags"])) or "none"))
+            if "project" in ch and ch["project"] and ch["project"] != it["project"]:
+                sets["project"] = ch["project"]
+                events.append(("moved", f"to {ch['project']}"))
+            if not sets:
+                return it
+            sets["updated_at"] = now_iso()
+            cols = ", ".join(f"{k}=?" for k in sets)
+            self.db.execute(f"UPDATE items SET {cols} WHERE id=?", (*sets.values(), it["id"]))
+            it = self.get(it["id"])
+            for action, detail in events:
+                self._log(it, actor, action, detail)
+        return it
+
+    def comment(self, ref, actor, text):
+        if not text.strip():
+            raise TTError("comment cannot be empty")
+        with self.tx():
+            it = self.get(ref)
+            self._log(it, actor, "commented", text.strip())
+        return it
+
+    def delete(self, ref, actor):
+        with self.tx():
+            it = self.get(ref)
+            self.db.execute("DELETE FROM items WHERE id=?", (it["id"],))
+            self._log(it, actor, "deleted")
+        return it
+
+    def list(self, project=None, statuses=None, kind=None, assignee=None, grep=None):
+        sql, args = "SELECT * FROM items WHERE 1=1", []
+        if project:
+            sql += " AND project=?"; args.append(project)
+        if statuses:
+            sql += f" AND status IN ({','.join('?' * len(statuses))})"; args += list(statuses)
+        if kind:
+            sql += " AND kind=?"; args.append(kind)
+        if assignee is not None:
+            sql += " AND assignee=?"; args.append(assignee)
+        if grep:
+            sql += " AND (title LIKE ? OR body LIKE ? OR note LIKE ?)"; args += [f"%{grep}%"] * 3
+        items = [self._row(r) for r in self.db.execute(sql, args)]
+        return sorted(items, key=sort_key)
+
+    def events(self, limit=40, project=None, item_id=None):
+        sql, args = "SELECT * FROM events WHERE 1=1", []
+        if project:
+            sql += " AND project=?"; args.append(project)
+        if item_id:
+            sql += " AND item_id=?"; args.append(item_id)
+        sql += " ORDER BY id DESC LIMIT ?"; args.append(limit)
+        return [dict(r) for r in self.db.execute(sql, args)]
+
+    def version(self):
+        return self.db.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()[0]
+
+    def projects(self):
+        rows = self.db.execute(
+            "SELECT project, SUM(status != 'done') AS open, COUNT(*) AS total FROM items"
+            " GROUP BY project ORDER BY project")
+        return [dict(r) for r in rows]
+
+    def assignees(self):
+        return [r[0] for r in self.db.execute(
+            "SELECT DISTINCT assignee FROM items WHERE assignee != '' ORDER BY assignee")]
+
+
+# ---------------------------------------------------------------- remote board
+
+def load_config():
+    """Return {url, token} for a shared board, or None to use the local database."""
+    if os.environ.get("TIANTASKS_URL"):
+        return {"url": os.environ["TIANTASKS_URL"], "token": os.environ.get("TIANTASKS_TOKEN", "")}
+    try:
+        cfg = json.loads(CONFIG.read_text())
+    except (OSError, ValueError):
+        return None
+    return cfg if cfg.get("url") else None
+
+
+def ssl_context():
+    # python.org builds of Python on macOS ship without CA certificates, so also trust the
+    # system bundle; otherwise every HTTPS call fails with CERTIFICATE_VERIFY_FAILED.
+    ctx = ssl.create_default_context()
+    for bundle in ("/etc/ssl/cert.pem", "/opt/homebrew/etc/ca-certificates/cert.pem"):
+        if os.path.exists(bundle):
+            ctx.load_verify_locations(bundle)
+    return ctx
+
+
+class RemoteStore:
+    """Same interface as Store, backed by a shared board's HTTP API."""
+
+    def __init__(self, url, token):
+        self.url, self.token, self._me = url.rstrip("/"), token, None
+        self.path = self.url
+
+    def _req(self, method, path, body=None, params=None):
+        if params:
+            path += "?" + urlencode({k: v for k, v in params.items() if v is not None})
+        # Cloudflare's bot check blocks Python's default User-Agent (error 1010), so name ourselves.
+        headers = {"Authorization": f"Bearer {self.token}", "X-Tiantasks": "1",
+                   "Content-Type": "application/json", "User-Agent": f"tiantasks-cli/{VERSION}"}
+        if os.environ.get("CLAUDECODE"):
+            headers["X-Tiantasks-Agent"] = "claude"
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(self.url + path, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=20, context=ssl_context()) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            try:
+                msg = json.load(e).get("error")
+            except Exception:
+                msg = None
+            if e.code == 401:
+                msg = "the shared board rejected your token; run `tt login` again"
+            raise TTError(msg or f"{self.url} returned HTTP {e.code}", e.code)
+        except urllib.error.URLError as e:
+            raise TTError(f"can't reach {self.url}: {e.reason}")
+
+    def _item(self, ref):
+        return f"/api/items/{quote(str(ref).strip().lstrip('#'))}"
+
+    def me(self):
+        if self._me is None:
+            self._me = self._req("GET", "/api/me")
+        return self._me
+
+    def get(self, ref):
+        return self._req("GET", self._item(ref))
+
+    def create(self, kind, title, project, actor, body="", priority="", tags=(), assignee=""):
+        return self._req("POST", "/api/items", {
+            "kind": kind, "title": title, "project": project, "body": body,
+            "priority": priority, "tags": list(tags), "assignee": assignee})
+
+    def update(self, ref, actor, **ch):
+        return self._req("PATCH", self._item(ref), ch)
+
+    def comment(self, ref, actor, text):
+        return self._req("POST", self._item(ref) + "/comment", {"text": text})
+
+    def delete(self, ref, actor):
+        return self._req("DELETE", self._item(ref))
+
+    def list(self, project=None, statuses=None, kind=None, assignee=None, grep=None):
+        return self._req("GET", "/api/items", params={
+            "project": project, "status": ",".join(statuses) if statuses else None,
+            "kind": kind, "assignee": assignee, "grep": grep})
+
+    def events(self, limit=40, project=None, item_id=None):
+        return self._req("GET", "/api/events",
+                         params={"limit": limit, "project": project, "item_id": item_id})
+
+    def projects(self):
+        return self._req("GET", "/api/projects")
+
+    def close(self):
+        pass
+
+
+# ---------------------------------------------------------------- context
+
+def current_actor(args=None):
+    store = getattr(args, "store", None)
+    if isinstance(store, RemoteStore):
+        return store.me()["actor"]  # the server decides who you are from your token
+    if args is not None and getattr(args, "actor", None):
+        return args.actor
+    if os.environ.get("TIANTASKS_ACTOR"):
+        return os.environ["TIANTASKS_ACTOR"]
+    if os.environ.get("CLAUDECODE"):
+        return "claude"
+    return getpass.getuser()
+
+
+def current_project(args=None):
+    if args is not None and getattr(args, "project", None):
+        return args.project
+    if os.environ.get("TIANTASKS_PROJECT"):
+        return os.environ["TIANTASKS_PROJECT"]
+    r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    return Path(r.stdout.strip()).name if r.returncode == 0 else Path.cwd().name
+
+
+# ---------------------------------------------------------------- terminal output
+
+COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def _c(code):
+    return lambda s: f"\033[{code}m{s}\033[0m" if COLOR else s
+
+
+dim, bold, green, red, yellow, cyan, strike = map(_c, ("2", "1", "32", "31", "33", "36", "9"))
+PRIO_COLOR = {"crit": red, "high": red, "med": yellow, "low": dim}
+
+
+def die(msg, code=1):
+    print(red(f"tiantasks: {msg}"), file=sys.stderr)
+    sys.exit(code)
+
+
+def show_ts(s):
+    """Timestamps from a hosted board are UTC ('...Z'); show them in local time."""
+    if s and s.endswith("Z"):
+        s = (dt.datetime.fromisoformat(s[:-1] + "+00:00").astimezone()
+             .replace(tzinfo=None).isoformat(timespec="seconds"))
+    return (s or "").replace("T", " ")
+
+
+def fmt(it, show_project=False):
+    box = {"done": green("[x]"), "doing": yellow("[~]"), "open": "[ ]"}[it["status"]]
+    ref = (red if it["kind"] == "issue" else cyan)(it["ref"].ljust(5))
+    title = strike(dim(it["title"])) if it["status"] == "done" else it["title"]
+    extras = []
+    if it["status"] == "doing":
+        extras.append(yellow("in progress"))
+    if it["priority"]:
+        extras.append(PRIO_COLOR[it["priority"]](it["priority"]))
+    if it["assignee"]:
+        extras.append(cyan("@" + it["assignee"]))
+    extras += [dim("#" + t) for t in it["tags"]]
+    if show_project:
+        extras.append(dim(f"[{it['project']}]"))
+    if it["status"] == "done":
+        extras.append(dim(f"resolved {show_ts(it['resolved_at'])[:10]}" + (f": {it['note']}" if it["note"] else "")))
+    return f"{box} {ref} {title}" + ("  " + " ".join(extras) if extras else "")
+
+
+def emit(args, item, verb, color=green):
+    if getattr(args, "json", False):
+        print(json.dumps(item, indent=2))
+    else:
+        print(f"{color(verb)} {fmt(item)}")
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_add(args, kind=None):
+    kind = kind or ("issue" if args.issue else "task")
+    assignee = args.to
+    if assignee == "me":
+        assignee = current_actor(args)
+    it = args.store.create(kind, " ".join(args.text), current_project(args), current_actor(args),
+                           body=args.desc or "", priority=args.priority or "",
+                           tags=args.tag or [], assignee=assignee or "")
+    emit(args, it, "added")
+
+
+def cmd_resolve(args):
+    for ref in args.ids:
+        it = args.store.update(ref, current_actor(args), status="done", note=args.message or "")
+        emit(args, it, "resolved")
+
+
+def cmd_status(status, verb, color):
+    def run(args):
+        for ref in args.ids:
+            ch = {"status": status}
+            if status == "doing" and not args.store.get(ref)["assignee"]:
+                ch["assignee"] = current_actor(args)
+            emit(args, args.store.update(ref, current_actor(args), **ch), verb, color)
+    return run
+
+
+def cmd_assign(args):
+    who = "" if args.who in ("nobody", "none", "-") else args.who
+    if who == "me":
+        who = current_actor(args)
+    for ref in args.ids:
+        emit(args, args.store.update(ref, current_actor(args), assignee=who), "assigned", cyan)
+
+
+def cmd_edit(args):
+    ch = {}
+    if args.text:
+        ch["title"] = " ".join(args.text)
+    if args.priority is not None:
+        ch["priority"] = "" if args.priority == "none" else args.priority
+    if args.desc is not None:
+        ch["body"] = args.desc
+    if args.tag or args.untag:
+        tags = args.store.get(args.id)["tags"]
+        tags += [t for t in clean_tags(args.tag or []) if t not in tags]
+        ch["tags"] = [t for t in tags if t not in clean_tags(args.untag or [])]
+    if args.move:
+        ch["project"] = args.move
+    if not ch:
+        die("nothing to change (pass new title, -p, -d, -t, --untag or --move)")
+    emit(args, args.store.update(args.id, current_actor(args), **ch), "edited", cyan)
+
+
+def cmd_comment(args):
+    it = args.store.comment(args.id, current_actor(args), " ".join(args.text))
+    print(f"{cyan('commented on')} {it['ref']}")
+
+
+def cmd_remove(args):
+    it = args.store.delete(args.id, current_actor(args))
+    print(f"{red('removed')} {it['ref']} {it['title']}")
+
+
+def cmd_list(args):
+    statuses = ["done"] if args.resolved else (None if args.all else ["open", "doing"])
+    kind = "task" if args.tasks else "issue" if args.issues else None
+    assignee = args.for_
+    if assignee == "me":
+        assignee = current_actor(args)
+    elif assignee in ("nobody", "none"):
+        assignee = ""
+    project = None if args.all_projects else current_project(args)
+    items = args.store.list(project, statuses, kind, assignee, args.grep)
+    if args.json:
+        print(json.dumps(items, indent=2))
+        return
+    scope = "all projects" if project is None else project
+    if not items:
+        print(dim(f"nothing here ({scope})."))
+        return
+    done = sorted((i for i in items if i["status"] == "done"), key=lambda i: i["resolved_at"], reverse=True)
+    groups = [("Issue queue", [i for i in items if i["kind"] == "issue" and i["status"] != "done"]),
+              ("Task queue", [i for i in items if i["kind"] == "task" and i["status"] != "done"]),
+              ("Resolved", done)]
+    print(dim(f"— {scope} —"))
+    for title, group in groups:
+        if group:
+            print(bold(f"\n{title} ({len(group)})"))
+            for i in group:
+                print("  " + fmt(i, show_project=project is None))
+
+
+def cmd_next(args):
+    who = args.for_ or current_actor(args)
+    project = None if args.all_projects else current_project(args)
+    items = args.store.list(project, ["open", "doing"], None, who)
+    if not items and args.any:
+        items = args.store.list(project, ["open", "doing"], None, "")
+    if not items:
+        if args.json:
+            print("null")
+        else:
+            print(dim(f"no open items for {who} in {project or 'any project'}."))
+        return
+    it = items[0]
+    if args.start and it["status"] != "doing":
+        it = args.store.update(it["id"], current_actor(args), status="doing", assignee=who)
+    if args.json:
+        print(json.dumps(it, indent=2))
+        return
+    print(fmt(it, show_project=project is None))
+    if it["body"]:
+        print("\n" + it["body"])
+
+
+def cmd_show(args):
+    it = args.store.get(args.id)
+    history = args.store.events(100, item_id=it["id"])
+    if args.json:
+        print(json.dumps({**it, "history": history}, indent=2))
+        return
+    print(fmt(it))
+    print(dim(f"  {it['kind']} · project {it['project']} · opened {show_ts(it['created_at'])}"
+              f" by {it['created_by']}"))
+    if it["body"]:
+        print("\n  " + it["body"].replace("\n", "\n  "))
+    print(dim("\n  history:"))
+    for e in reversed(history):
+        detail = f": {e['detail']}" if e["detail"] else ""
+        print(dim(f"    {show_ts(e['at'])}  {e['actor']} {e['action']}{detail}"))
+
+
+def cmd_log(args):
+    project = None if args.all_projects else current_project(args)
+    for e in reversed(args.store.events(args.n, project)):
+        detail = f": {e['detail']}" if e["detail"] else ""
+        print(f"{dim(show_ts(e['at']))}  {e['actor']} {e['action']} "
+              f"{e['ref']} {e['title']}{dim(detail)}")
+
+
+def cmd_projects(args):
+    for p in args.store.projects():
+        print(f"{p['project']:<30} {p['open']} open / {p['total']} total")
+
+
+# ---------------------------------------------------------------- web server
+
+def server_up(port):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/ping", timeout=0.5) as r:
+            return json.load(r).get("app") == "tiantasks"
+    except Exception:
+        return False
+
+
+def parse_users(spec):
+    """TIANTASKS_USERS="tianli:<token>,oliver:<token>" -> {token: name}."""
+    users = {}
+    for part in filter(None, (p.strip() for p in (spec or "").split(","))):
+        name, _, token = part.partition(":")
+        if not re.fullmatch(r"[a-z0-9_.]+", name or "") or len(token) < 20:
+            raise SystemExit(f"bad TIANTASKS_USERS entry {name!r}: need lowercase-name:token (20+ chars)")
+        users[token] = name
+    return users
+
+
+def make_handler(db_path, me, users=None):
+    """`users` is None for a private local board, or {token: name} for a shared one."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body, ctype="application/json", headers=()):
+            data = body if isinstance(body, bytes) else json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            for k, v in headers:
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _body(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            return json.loads(self.rfile.read(n)) if n else {}
+
+        def _user_for(self, token):
+            for known, name in users.items():
+                if token and hmac.compare_digest(token.encode(), known.encode()):
+                    return name
+            return None
+
+        def _authed_user(self):
+            auth = self.headers.get("Authorization", "")
+            if auth.startswith("Bearer "):
+                return self._user_for(auth[7:].strip())
+            cookie = SimpleCookie(self.headers.get("Cookie", ""))
+            return self._user_for(cookie["tt_token"].value) if "tt_token" in cookie else None
+
+        def _cookie(self, value, max_age):
+            secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
+            return ("Set-Cookie", f"tt_token={value}; Path=/; Max-Age={max_age}; HttpOnly; "
+                                  f"SameSite=Strict{secure}")
+
+        def _login(self, method, path):
+            if path == "/logout":
+                return self._send(303, b"", headers=[("Location", "/"), self._cookie("", 0)])
+            if method == "POST":
+                n = int(self.headers.get("Content-Length") or 0)
+                token = parse_qs(self.rfile.read(n).decode()).get("token", [""])[0].strip()
+                if self._user_for(token):
+                    return self._send(303, b"", headers=[("Location", "/"),
+                                                         self._cookie(token, 60 * 60 * 24 * 365)])
+                return self._send(401, LOGIN_PAGE.replace("<!--err-->", "That token isn't valid.").encode(),
+                                  "text/html; charset=utf-8")
+            return self._send(200, LOGIN_PAGE.encode(), "text/html; charset=utf-8")
+
+        def _handle(self, method):
+            url = urlparse(self.path)
+            if url.path == "/api/ping":
+                return self._send(200, {"app": "tiantasks", "version": VERSION})
+            if url.path == "/tiantasks":  # the CLI itself, so teammates can install it from here
+                return self._send(200, Path(os.path.realpath(__file__)).read_bytes(),
+                                  "text/x-python; charset=utf-8")
+            if users is None:
+                # Private board: only answer same-machine requests (blocks DNS rebinding).
+                host = (self.headers.get("Host") or "").rsplit(":", 1)[0]
+                if host not in ("127.0.0.1", "localhost"):
+                    return self._send(403, {"error": "forbidden host"})
+                user = me
+            else:
+                if url.path in ("/login", "/logout"):
+                    return self._login(method, url.path)
+                user = self._authed_user()
+                if not user:
+                    if method == "GET" and url.path == "/":
+                        return self._login("GET", "/login")
+                    return self._send(401, {"error": "not signed in"})
+            # Writes need a custom header, which other websites can't send cross-origin.
+            if method != "GET" and self.headers.get("X-Tiantasks") != "1":
+                return self._send(403, {"error": "missing X-Tiantasks header"})
+            actor = user
+            if self.headers.get("X-Tiantasks-Agent") == "claude":
+                actor = "claude" if users is None else f"claude-{user}"
+            q = {k: v[0] for k, v in parse_qs(url.query, keep_blank_values=True).items()}
+            store = Store(db_path)
+            try:
+                return self._route(method, url.path, q, store, user, actor)
+            except TTError as e:
+                return self._send(e.status, {"error": str(e)})
+            except (ValueError, KeyError, TypeError) as e:
+                return self._send(400, {"error": str(e)})
+            finally:
+                store.close()
+
+        def _route(self, method, path, q, store, user, actor):
+            m = re.fullmatch(r"/api/items/([A-Za-z]?-?\d+)(/events|/comment)?", path)
+            if method == "GET" and path == "/":
+                return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+            if method == "GET" and path == "/api/version":
+                return self._send(200, {"v": store.version()})
+            if method == "GET" and path == "/api/me":
+                return self._send(200, {"user": user, "actor": actor, "shared": users is not None})
+            if method == "GET" and path == "/api/state":
+                project = q.get("project") or None
+                people = set(users.values()) if users is not None else {me}
+                agents = {f"claude-{p}" for p in people} if users is not None else {"claude"}
+                return self._send(200, {
+                    "me": user, "shared": users is not None,
+                    "items": store.list(project),
+                    "events": store.events(40, project),
+                    "projects": store.projects(),
+                    "assignees": sorted(set(store.assignees()) | people | agents),
+                })
+            if method == "GET" and path == "/api/items":
+                st = q.get("status")
+                return self._send(200, store.list(
+                    q.get("project") or None, st.split(",") if st else None, q.get("kind") or None,
+                    q["assignee"] if "assignee" in q else None, q.get("grep") or None))
+            if method == "GET" and path == "/api/events":
+                item_id = int(q["item_id"]) if q.get("item_id") else None
+                return self._send(200, store.events(int(q.get("limit") or 40),
+                                                    q.get("project") or None, item_id))
+            if method == "GET" and path == "/api/projects":
+                return self._send(200, store.projects())
+            if method == "GET" and m and not m.group(2):
+                return self._send(200, store.get(m.group(1)))
+            if method == "GET" and m and m.group(2) == "/events":
+                return self._send(200, store.events(200, item_id=store.get(m.group(1))["id"]))
+            if method == "POST" and path == "/api/items":
+                b = self._body()
+                return self._send(201, store.create(
+                    b.get("kind", "task"), b.get("title", ""), b.get("project") or "general", actor,
+                    body=b.get("body", ""), priority=b.get("priority", ""),
+                    tags=b.get("tags", []), assignee=b.get("assignee", "")))
+            if method == "POST" and m and m.group(2) == "/comment":
+                return self._send(200, store.comment(m.group(1), actor, self._body().get("text", "")))
+            if method == "PATCH" and m and not m.group(2):
+                allowed = {"status", "note", "assignee", "priority", "title", "body", "tags", "project"}
+                ch = {k: v for k, v in self._body().items() if k in allowed}
+                return self._send(200, store.update(m.group(1), actor, **ch))
+            if method == "DELETE" and m and not m.group(2):
+                return self._send(200, store.delete(m.group(1), actor))
+            if method == "POST" and path == "/api/shutdown" and users is None:
+                self._send(200, {"ok": True})
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                return
+            return self._send(404, {"error": "not found"})
+
+        def do_GET(self):
+            self._handle("GET")
+
+        def do_POST(self):
+            self._handle("POST")
+
+        def do_PATCH(self):
+            self._handle("PATCH")
+
+        def do_DELETE(self):
+            self._handle("DELETE")
+
+    return Handler
+
+
+def cmd_serve(args):
+    db_path = args.store.path
+    args.store.close()
+    users = parse_users(os.environ.get("TIANTASKS_USERS")) or None
+    if users is None and args.host not in ("127.0.0.1", "localhost"):
+        die("refusing to serve on a public address without logins; set TIANTASKS_USERS")
+    handler = make_handler(db_path, current_actor(args), users)
+    srv = ThreadingHTTPServer((args.host, args.port), handler)
+    mode = f"shared, {len(users)} users" if users else "private"
+    print(f"Tiantasks on http://{args.host}:{args.port} ({mode}, db: {db_path})  Ctrl-C to stop",
+          flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_login(args):
+    url = args.url.rstrip("/")
+    if not re.match(r"https?://", url):
+        url = "https://" + url
+    if url.startswith("http://") and not re.match(r"http://(127\.0\.0\.1|localhost)[:/]", url + "/"):
+        die("use an https:// URL so your token isn't sent in the clear")
+    token = os.environ.get("TIANTASKS_TOKEN") or getpass.getpass("Token (input hidden): ").strip()
+    me = RemoteStore(url, token).me()
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG.touch(mode=0o600)
+    CONFIG.write_text(json.dumps({"url": url, "token": token}, indent=2))
+    os.chmod(CONFIG, 0o600)
+    print(green(f"signed in to {url} as {me['user']}"))
+    print(dim(f"`tt` now uses this shared board. Your Claude Code sessions act as claude-{me['user']}."))
+
+
+def cmd_logout(args):
+    if CONFIG.exists():
+        CONFIG.unlink()
+        print("signed out; `tt` is back to your local board")
+    else:
+        print(dim("not signed in to a shared board"))
+
+
+def cmd_whoami(args):
+    if isinstance(args.store, RemoteStore):
+        me = args.store.me()
+        print(f"{me['actor']}  (signed in as {me['user']} on shared board {args.store.url})")
+    else:
+        print(f"{current_actor(args)}  (local board {args.store.path})")
+
+
+def cmd_ui(args):
+    if isinstance(args.store, RemoteStore):
+        print(f"Shared board: {args.store.url}")
+        if not args.no_open:
+            webbrowser.open(args.store.url)
+        return
+    url = f"http://127.0.0.1:{args.port}"
+    if args.stop:
+        if not server_up(args.port):
+            print(dim("not running"))
+            return
+        req = urllib.request.Request(url + "/api/shutdown", method="POST", headers={"X-Tiantasks": "1"})
+        urllib.request.urlopen(req, timeout=2).read()
+        print("stopped")
+        return
+    if not server_up(args.port):
+        log = open(args.store.path.parent / "server.log", "a")
+        env = {**os.environ, "TIANTASKS_DB": str(args.store.path)}
+        env.pop("CLAUDECODE", None)  # edits made on the page are yours, not Claude's
+        env.pop("TIANTASKS_ACTOR", None)
+        subprocess.Popen([sys.executable, os.path.realpath(__file__), "serve", "--port", str(args.port)],
+                         stdout=log, stderr=log, stdin=subprocess.DEVNULL, env=env,
+                         start_new_session=True)
+        for _ in range(50):
+            if server_up(args.port):
+                break
+            time.sleep(0.1)
+        else:
+            die(f"server didn't start; see {log.name}")
+    print(f"Tiantasks is running at {url}")
+    if not args.no_open:
+        webbrowser.open(url)
+
+
+# ---------------------------------------------------------------- Claude Code integration
+
+SKILL_MD = """---
+name: tiantasks
+description: The user's task and issue queues (possibly shared with teammates), managed with the `tt` CLI. Use when the user mentions tasks, tickets, issues, todos, "the queue", "your queue" or Tiantasks; when asked to work on the next task or on assigned work; when you find a bug you won't fix right now; or when your work resolves an open item.
+---
+
+# Tiantasks
+
+`tt` (also `tiantasks`) stores tasks (T-n) and issues (I-n) in a database outside the repo,
+grouped by project (the git repo name by default). There is nothing to stage or commit. People
+watch a live page (`tt ui` opens it), so your changes show up for them right away.
+
+**Your identity:** run `tt whoami`. On a private board you are `claude`; on a shared board you
+are `claude-<user>` (for example `claude-oliver`), so each person's Claude has its own queue.
+`tt` fills this in automatically; `tt next` only hands you items assigned to you.
+
+## Commands
+
+| Command | Does |
+|---|---|
+| `tt list` · `tt list --for me` · `tt list -A` · `--json` | Open items in this project (`-A` = every project; `--all` includes resolved) |
+| `tt next --start` | Take the top item assigned to you and mark it in progress; `--any` also takes unassigned work |
+| `tt add "title" [-p crit\\|high\\|med\\|low] [-t tag] [-d "details"] [--to NAME]` | New task |
+| `tt issue "title" [same flags]` | New issue / bug |
+| `tt start ID` · `tt stop ID` | Mark in progress / back to open |
+| `tt resolve ID [ID…] -m "what you did"` | Check it off (shown struck through) with a resolution note |
+| `tt assign ID NAME` · `tt comment ID "text"` · `tt edit ID …` · `tt reopen ID` | Housekeeping |
+| `tt show ID` | Full details and history |
+
+## Workflow
+
+1. **Asked to work the queue or "do your tasks":** run `tt next --start`, do the work, then
+   `tt resolve <ID> -m "<one-line summary of the change>"`. Repeat until `tt next` comes back
+   empty or the user says to stop.
+2. **You find a bug, failing test or tech debt you're not fixing now:**
+   `tt issue "<one-line summary>" -p <priority> -t <area> -d "<repro or file:line>"`.
+3. **You identify follow-up work:** `tt add "<summary>"`. Only use `--to me` (assign yourself)
+   if the user asked you to take it on. Assign teammates by name only when asked.
+4. **You finish something that matches an open item** (check `tt list`): resolve it with a note.
+5. Mention the IDs you opened or resolved in your reply.
+6. If `tt` says it can't reach the shared board or the token was rejected, tell the user; don't
+   fall back to editing anything by hand.
+
+Keep titles to one line and put details in `-d` or `tt comment`. Use `--json` when you need to
+parse the output.
+"""
+
+CLAUDE_MD_SNIPPET = """
+## Task and issue queues (Tiantasks)
+
+Tasks and issues for this project are tracked with the `tt` CLI (outside the repo).
+- Check the queue: `tt list` · take your next item: `tt next --start`
+- Log bugs you won't fix now: `tt issue "<summary>" -p high -d "<details>"`
+- Close finished work: `tt resolve <ID> -m "<what you did>"`
+"""
+
+
+def cmd_claude_setup(args):
+    if args.project_md:
+        r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+        target = Path(r.stdout.strip() if r.returncode == 0 else Path.cwd()) / "CLAUDE.md"
+        existing = target.read_text() if target.exists() else ""
+        if "Tiantasks" in existing:
+            print(dim(f"{target} already mentions Tiantasks"))
+            return
+        target.write_text(existing.rstrip() + ("\n" if existing else "") + CLAUDE_MD_SNIPPET)
+        print(green(f"added Tiantasks instructions to {target}"))
+        return
+    skill = Path.home() / ".claude" / "skills" / "tiantasks" / "SKILL.md"
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    skill.write_text(SKILL_MD)
+    print(green(f"installed Claude Code skill at {skill}"))
+
+
+# ---------------------------------------------------------------- CLI
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--project", default=argparse.SUPPRESS,
+                        help="project name (default: git repo name)")
+    common.add_argument("--as", dest="actor", default=argparse.SUPPRESS,
+                        help="who is making the change (default: you, or 'claude' in Claude Code)")
+
+    p = argparse.ArgumentParser(
+        prog="tt",
+        description="Tiantasks: task and issue queues with a live local page.",
+        epilog="examples:\n"
+               "  tt ui                                   open the live page\n"
+               "  tt add \"Write onboarding docs\" -t docs\n"
+               "  tt issue \"Login crashes on empty password\" -p high --to claude\n"
+               "  tt next --start                         take the next item assigned to you\n"
+               "  tt resolve I-1 -m \"Validate input before submit\"",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--version", action="version", version=f"tiantasks {VERSION}")
+    sub = p.add_subparsers(dest="cmd", metavar="<command>")
+
+    def add_cmd(name, fn, help, aliases=()):
+        sp = sub.add_parser(name, parents=[common], help=help, aliases=list(aliases))
+        sp.set_defaults(fn=fn)
+        return sp
+
+    for name, kind, help, aliases in [("add", None, "add a task", ("task", "new")),
+                                      ("issue", "issue", "open an issue", ("bug",))]:
+        sp = add_cmd(name, lambda a, k=kind: cmd_add(a, k), help, aliases)
+        sp.add_argument("text", nargs="+")
+        sp.add_argument("-p", "--priority", choices=PRIORITIES)
+        sp.add_argument("-t", "--tag", action="append", help="tag (repeatable)")
+        sp.add_argument("-d", "--desc", help="longer description")
+        sp.add_argument("--to", help="assignee (a name, 'claude' or 'me')")
+        sp.add_argument("--json", action="store_true")
+        if name == "add":
+            sp.add_argument("-i", "--issue", action="store_true", help="make it an issue")
+
+    sp = add_cmd("resolve", cmd_resolve, "check off items", ("done", "close", "fix"))
+    sp.add_argument("ids", nargs="+", metavar="ID")
+    sp.add_argument("-m", "--message", help="resolution note")
+    sp.add_argument("--json", action="store_true")
+
+    for name, status, verb, color, help in [
+        ("start", "doing", "started", yellow, "mark in progress (assigns you if unassigned)"),
+        ("stop", "open", "paused", dim, "move back to open"),
+        ("reopen", "open", "reopened", yellow, "reopen a resolved item"),
+    ]:
+        sp = add_cmd(name, cmd_status(status, verb, color), help)
+        sp.add_argument("ids", nargs="+", metavar="ID")
+        sp.add_argument("--json", action="store_true")
+
+    sp = add_cmd("assign", cmd_assign, "assign items to someone ('claude', 'me', 'nobody')")
+    sp.add_argument("ids", nargs="+", metavar="ID")
+    sp.add_argument("who")
+    sp.add_argument("--json", action="store_true")
+
+    sp = add_cmd("edit", cmd_edit, "change title, priority, description or tags")
+    sp.add_argument("id", metavar="ID")
+    sp.add_argument("text", nargs="*")
+    sp.add_argument("-p", "--priority", choices=PRIORITIES + ("none",))
+    sp.add_argument("-d", "--desc")
+    sp.add_argument("-t", "--tag", action="append")
+    sp.add_argument("--untag", action="append")
+    sp.add_argument("--move", metavar="PROJECT", help="move to another project")
+    sp.add_argument("--json", action="store_true")
+
+    sp = add_cmd("comment", cmd_comment, "add a comment to an item's history")
+    sp.add_argument("id", metavar="ID")
+    sp.add_argument("text", nargs="+")
+
+    sp = add_cmd("remove", cmd_remove, "delete an item", ("rm",))
+    sp.add_argument("id", metavar="ID")
+
+    sp = add_cmd("list", cmd_list, "show the queues (open items in this project)", ("ls",))
+    sp.add_argument("-a", "--all", action="store_true", help="include resolved")
+    sp.add_argument("-r", "--resolved", action="store_true", help="only resolved")
+    sp.add_argument("-A", "--all-projects", action="store_true")
+    sp.add_argument("--tasks", action="store_true")
+    sp.add_argument("--issues", action="store_true")
+    sp.add_argument("--for", dest="for_", metavar="NAME", help="assignee ('me', 'claude', 'nobody')")
+    sp.add_argument("-g", "--grep")
+    sp.add_argument("--json", action="store_true")
+
+    sp = add_cmd("next", cmd_next, "show the top item assigned to you")
+    sp.add_argument("--for", dest="for_", metavar="NAME")
+    sp.add_argument("--start", action="store_true", help="mark it in progress")
+    sp.add_argument("--any", action="store_true", help="fall back to unassigned items")
+    sp.add_argument("-A", "--all-projects", action="store_true")
+    sp.add_argument("--json", action="store_true")
+
+    sp = add_cmd("show", cmd_show, "details and history for one item")
+    sp.add_argument("id", metavar="ID")
+    sp.add_argument("--json", action="store_true")
+
+    sp = add_cmd("log", cmd_log, "recent activity")
+    sp.add_argument("-n", type=int, default=20)
+    sp.add_argument("-A", "--all-projects", action="store_true")
+
+    add_cmd("projects", cmd_projects, "list projects")
+
+    sp = add_cmd("ui", cmd_ui, "open the live page (starts the server if needed)")
+    sp.add_argument("--port", type=int, default=DEFAULT_PORT)
+    sp.add_argument("--no-open", action="store_true")
+    sp.add_argument("--stop", action="store_true", help="stop the background server")
+
+    sp = add_cmd("serve", cmd_serve, "run the web server in the foreground")
+    sp.add_argument("--port", type=int, default=DEFAULT_PORT)
+    sp.add_argument("--host", default="127.0.0.1",
+                    help="bind address; anything public requires TIANTASKS_USERS logins")
+
+    sp = add_cmd("login", cmd_login, "use a shared board (prompts for your token)")
+    sp.add_argument("url")
+    add_cmd("logout", cmd_logout, "go back to your local board")
+    add_cmd("whoami", cmd_whoami, "show which board and identity `tt` is using")
+
+    sp = add_cmd("claude-setup", cmd_claude_setup, "install the Claude Code skill")
+    sp.add_argument("--repo", action="store_true", dest="project_md",
+                    help="add a note to this repo's CLAUDE.md instead")
+
+    add_cmd("help", lambda a: p.print_help(), "show this help")
+    return p
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    parser = build_parser()
+    args = parser.parse_args(argv or ["list"])
+    if not getattr(args, "fn", None):
+        parser.print_help()
+        return
+    try:
+        cfg = None if args.cmd in ("serve", "login", "logout") else load_config()
+        args.store = RemoteStore(cfg["url"], cfg["token"]) if cfg else Store()
+        args.fn(args)
+    except TTError as e:
+        die(str(e))
+
+
+# ---------------------------------------------------------------- page
+
+PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tiantasks</title>
+<style>
+:root {
+  --bg: #f5f4f0; --panel: #ffffff; --ink: #1c1c1e; --muted: #6d6d72; --line: #e3e1db;
+  --chip: #eeede8; --accent: #3651d4; --issue: #c62f2f; --task: #1d6fc0; --ok: #2d8a45;
+  --warn: #b85a0b; --doing: #fff6e6; --shadow: 0 1px 2px rgba(0,0,0,.04);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131315; --panel: #1c1c1f; --ink: #ececef; --muted: #9b9ba3; --line: #2d2d32;
+    --chip: #28282d; --accent: #8198ff; --issue: #ff7070; --task: #62adff; --ok: #5ccf74;
+    --warn: #ffab5c; --doing: #2a2418; --shadow: none;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+select, input, textarea, button { font: inherit; color: inherit; }
+select, input, textarea { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 6px 9px; min-width: 0; }
+input:focus, select:focus { outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent); outline-offset: -1px; }
+button { cursor: pointer; border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 6px 11px; }
+button:hover { border-color: var(--muted); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+button.link { border: 0; background: none; padding: 2px 4px; color: var(--muted); font-size: 12px; }
+button.link:hover { color: var(--ink); }
+button.danger { color: var(--issue); }
+
+header { position: sticky; top: 0; z-index: 5; background: color-mix(in srgb, var(--panel) 92%, transparent);
+  backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
+.bar { max-width: 1320px; margin: 0 auto; padding: 12px 20px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+h1 { font-size: 18px; margin: 0 8px 0 0; letter-spacing: -0.01em; display: flex; align-items: center; gap: 8px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+.dot.off { background: var(--issue); }
+.spacer { flex: 1; }
+.stats { color: var(--muted); font-size: 13px; }
+label.f { display: flex; gap: 6px; align-items: center; color: var(--muted); font-size: 13px; }
+
+main { max-width: 1320px; margin: 0 auto; padding: 18px 20px 40px; display: grid; gap: 18px;
+  grid-template-columns: minmax(0,1fr) minmax(0,1fr) 300px; align-items: start; }
+@media (max-width: 1080px) { main { grid-template-columns: minmax(0,1fr) minmax(0,1fr); } aside { grid-column: 1 / -1; } }
+@media (max-width: 720px) { main { grid-template-columns: minmax(0,1fr); padding: 14px 16px 32px; } .bar { padding: 10px 16px; } }
+
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); min-width: 0; }
+form.add { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; padding: 10px; align-items: center; }
+form.add input[name=title] { flex: 1 1 260px; }
+form.add input[name=tags] { width: 130px; }
+form.add input[name=project] { width: 150px; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; flex: none; }
+.seg button { border: 0; border-radius: 0; padding: 6px 12px; background: transparent; }
+.seg button.on[data-kind=task] { background: var(--task); color: #fff; }
+.seg button.on[data-kind=issue] { background: var(--issue); color: #fff; }
+
+.qh { display: flex; align-items: center; gap: 8px; padding: 14px 16px 10px; }
+.qh h2 { font-size: 15px; margin: 0; }
+.qh .sw { width: 10px; height: 10px; border-radius: 3px; }
+.count { color: var(--muted); font-size: 13px; }
+.empty { padding: 18px 16px 22px; color: var(--muted); border-top: 1px solid var(--line); }
+
+.item { border-top: 1px solid var(--line); padding: 10px 14px 10px 16px; }
+.item.doing { background: var(--doing); box-shadow: inset 3px 0 0 var(--warn); }
+.row { display: flex; gap: 10px; align-items: flex-start; }
+.check { width: 18px; height: 18px; flex: none; margin-top: 1px; padding: 0; border: 1.5px solid var(--muted);
+  border-radius: 5px; background: none; display: grid; place-items: center; font-size: 12px; line-height: 1; color: #fff; }
+.check:hover { border-color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }
+.done .check { background: var(--ok); border-color: var(--ok); }
+.ref { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); flex: none; margin-top: 2px; }
+.title { flex: 1; min-width: 0; cursor: pointer; overflow-wrap: anywhere; }
+.title:hover { color: var(--accent); }
+.done .title { text-decoration: line-through; color: var(--muted); }
+.meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 6px 0 0 28px; }
+.pill { font-size: 12px; padding: 1px 8px; border-radius: 999px; background: var(--chip); color: var(--muted); white-space: nowrap; }
+.pill.p-crit { background: var(--issue); color: #fff; }
+.pill.p-high { background: color-mix(in srgb, var(--issue) 16%, transparent); color: var(--issue); }
+.pill.p-med { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
+.pill.st { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); font-weight: 600; }
+.pill.who { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); }
+.meta select { font-size: 12px; padding: 1px 6px; border-radius: 999px; }
+.note { margin: 6px 0 0 28px; font-size: 13px; color: var(--muted); }
+.note::before { content: "✓ "; color: var(--ok); }
+
+.detail { margin: 10px 0 2px 28px; display: grid; gap: 10px; }
+.detail .body { white-space: pre-wrap; font-size: 13px; }
+.detail .inline { display: flex; gap: 6px; flex-wrap: wrap; }
+.detail .inline input { flex: 1 1 180px; }
+.hist { font-size: 12px; color: var(--muted); display: grid; gap: 3px; max-height: 220px; overflow: auto; }
+.hist b { color: var(--ink); font-weight: 600; }
+
+details.resolved > summary { list-style: none; cursor: pointer; padding: 10px 16px; border-top: 1px solid var(--line);
+  color: var(--muted); font-size: 13px; }
+details.resolved > summary::-webkit-details-marker { display: none; }
+details.resolved > summary::before { content: "▸ "; }
+details.resolved[open] > summary::before { content: "▾ "; }
+
+aside h2 { font-size: 15px; margin: 0; padding: 14px 16px 10px; }
+.ev { border-top: 1px solid var(--line); padding: 8px 16px; font-size: 13px; overflow-wrap: anywhere; }
+.ev .t { color: var(--muted); font-size: 12px; }
+.ev b { font-weight: 600; }
+.ev .claude { color: var(--accent); }
+.hint { padding: 12px 16px 16px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+#acct a { color: inherit; }
+code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--chip); padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header><div class="bar">
+  <h1>Tiantasks <span class="dot" id="dot" title="Live"></span></h1>
+  <label class="f">Project <select id="fProject"></select></label>
+  <label class="f">Assigned to <select id="fWho"></select></label>
+  <span class="spacer"></span>
+  <span class="stats" id="stats"></span>
+  <span class="stats" id="acct"></span>
+</div></header>
+
+<main>
+  <form class="add card" id="add" autocomplete="off">
+    <div class="seg" role="group" aria-label="Kind">
+      <button type="button" data-kind="task" class="on">Task</button>
+      <button type="button" data-kind="issue">Issue</button>
+    </div>
+    <input name="title" placeholder="Add a task… (press Enter)" aria-label="Title" required>
+    <select name="priority" aria-label="Priority">
+      <option value="">No priority</option><option value="crit">crit</option><option value="high">high</option>
+      <option value="med">med</option><option value="low">low</option>
+    </select>
+    <select name="assignee" aria-label="Assignee"></select>
+    <input name="tags" placeholder="tags" aria-label="Tags">
+    <input name="project" placeholder="project" aria-label="Project" list="projList" required>
+    <datalist id="projList"></datalist>
+    <button class="primary">Add</button>
+  </form>
+
+  <section class="card" id="qIssue"></section>
+  <section class="card" id="qTask"></section>
+
+  <aside class="card">
+    <h2>Activity</h2>
+    <div id="events"></div>
+    <div class="hint">Changes from Claude Code show up here live. Assign items to a Claude
+      (<b>claude</b>, or <b>claude-name</b> on a shared board), then in that repo ask it to
+      “work through your Tiantasks queue”.</div>
+  </aside>
+</main>
+
+<script>
+const $ = (s, el = document) => el.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const PR = {crit: 0, high: 1, med: 2, low: 3};
+const saved = {
+  get(k, d) { try { return localStorage.getItem('tt.' + k) ?? d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem('tt.' + k, v); } catch {} },
+};
+
+let S = null, lastText = '', kind = 'task';
+let project = saved.get('project', ''), who = saved.get('who', '');
+const expanded = new Set();
+
+async function api(method, path, body) {
+  const r = await fetch(path, {method, headers: {'Content-Type': 'application/json', 'X-Tiantasks': '1'},
+    body: body ? JSON.stringify(body) : undefined});
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) { alert(data.error || ('Error ' + r.status)); throw new Error(data.error); }
+  return data;
+}
+
+function typing() {
+  const a = document.activeElement;
+  return a && a.closest && a.closest('.item') && (a.tagName === 'INPUT' || a.tagName === 'SELECT');
+}
+
+// Every write bumps a version number, so polling it is one tiny query. The full board is
+// only fetched when something changed, and nothing is polled while the tab is hidden.
+let lastVersion = null;
+async function tick() {
+  if (document.hidden || typing()) return;
+  try {
+    const r = await fetch('/api/version');
+    if (r.status === 401) { location.reload(); return; }
+    const {v} = await r.json();
+    $('#dot').classList.remove('off');
+    if (v !== lastVersion) { lastVersion = v; await refresh(true); }
+  } catch { $('#dot').classList.add('off'); }
+}
+
+async function refresh(force) {
+  try {
+    const r = await fetch('/api/state?project=' + encodeURIComponent(project));
+    if (r.status === 401) { location.reload(); return; }
+    const text = await r.text();
+    $('#dot').classList.remove('off');
+    if (!force && text === lastText) return;
+    lastText = text; S = JSON.parse(text);
+    if (project && !S.projects.some(p => p.project === project)) { project = ''; return refresh(true); }
+    render();
+  } catch { $('#dot').classList.add('off'); }
+}
+
+function ago(iso) {
+  const s = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (s < 60) return 'just now';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  if (s < 86400 * 7) return Math.floor(s / 86400) + 'd ago';
+  return iso.slice(0, 10);
+}
+
+const byQueue = (a, b) => (a.status === 'doing' ? 0 : 1) - (b.status === 'doing' ? 0 : 1)
+  || (PR[a.priority] ?? 9) - (PR[b.priority] ?? 9) || a.created_at.localeCompare(b.created_at);
+
+function options(list, sel) {
+  return list.map(([v, l]) => `<option value="${esc(v)}"${v === sel ? ' selected' : ''}>${esc(l)}</option>`).join('');
+}
+function assigneeOptions(sel) {
+  return options([['', 'Unassigned'], ...S.assignees.map(n => [n, n === S.me ? `${n} (you)` : n])], sel);
+}
+
+function itemHTML(it) {
+  const done = it.status === 'done';
+  const meta = [];
+  if (it.status === 'doing') meta.push(`<span class="pill st">In progress</span>`);
+  if (it.priority) meta.push(`<span class="pill p-${it.priority}">${it.priority}</span>`);
+  if (!project) meta.push(`<span class="pill">${esc(it.project)}</span>`);
+  it.tags.forEach(t => meta.push(`<span class="pill">#${esc(t)}</span>`));
+  if (done) {
+    if (it.assignee) meta.push(`<span class="pill who">@${esc(it.assignee)}</span>`);
+    meta.push(`<span class="pill">resolved ${ago(it.resolved_at)}</span>`);
+  } else {
+    meta.push(`<select data-act="assign" aria-label="Assignee">${assigneeOptions(it.assignee)}</select>`);
+    meta.push(it.status === 'doing'
+      ? `<button class="link" data-act="pause">Pause</button>`
+      : `<button class="link" data-act="start">Start</button>`);
+  }
+  let detail = '';
+  if (expanded.has(it.id)) {
+    detail = `<div class="detail">
+      ${it.body ? `<div class="body">${esc(it.body)}</div>` : ''}
+      ${done ? '' : `<div class="inline"><input data-f="note" placeholder="Resolution note (optional)">
+        <button data-act="resolveNote">Resolve</button></div>`}
+      <div class="inline"><select data-act="priority" aria-label="Priority">${options([['', 'No priority'], ...Object.keys(PR).map(p => [p, p])], it.priority)}</select>
+        <input data-f="comment" placeholder="Add a comment"><button data-act="comment">Comment</button></div>
+      <div class="hist" id="hist-${it.id}">Loading history…</div>
+      <div><button class="link danger" data-act="delete">Delete ${it.ref}</button></div>
+    </div>`;
+    loadHistory(it.id);
+  }
+  return `<div class="item ${it.status}" data-id="${it.id}">
+    <div class="row">
+      <button class="check" data-act="toggle" title="${done ? 'Reopen' : 'Resolve'}" aria-label="${done ? 'Reopen' : 'Resolve'} ${it.ref}">${done ? '✓' : ''}</button>
+      <span class="ref">${it.ref}</span>
+      <span class="title" data-act="expand" title="Show details">${esc(it.title)}</span>
+    </div>
+    <div class="meta">${meta.join('')}</div>
+    ${done && it.note ? `<div class="note">${esc(it.note)}</div>` : ''}
+    ${detail}
+  </div>`;
+}
+
+async function loadHistory(id) {
+  const evs = await fetch(`/api/items/${id}/events`).then(r => r.json());
+  const el = document.getElementById('hist-' + id);
+  if (el) el.innerHTML = evs.map(e => `<div>${ago(e.at)} · <b>${esc(e.actor)}</b> ${esc(e.action)}${e.detail ? ': ' + esc(e.detail) : ''}</div>`).join('');
+}
+
+function queueHTML(title, color, items, emptyMsg) {
+  const active = items.filter(i => i.status !== 'done').sort(byQueue);
+  const done = items.filter(i => i.status === 'done').sort((a, b) => b.resolved_at.localeCompare(a.resolved_at));
+  const doing = active.filter(i => i.status === 'doing').length;
+  return `<div class="qh"><span class="sw" style="background:${color}"></span><h2>${title}</h2>
+      <span class="count">${active.length} open${doing ? ` · ${doing} in progress` : ''}</span></div>
+    ${active.length ? active.map(itemHTML).join('') : `<div class="empty">${emptyMsg}</div>`}
+    ${done.length ? `<details class="resolved" data-q="${title}"${saved.get('open.' + title) === '1' ? ' open' : ''}>
+      <summary>Resolved (${done.length})</summary>${done.slice(0, 100).map(itemHTML).join('')}</details>` : ''}`;
+}
+
+function render() {
+  const projects = S.projects.map(p => [p.project, `${p.project} (${p.open})`]);
+  $('#fProject').innerHTML = options([['', 'All projects'], ...projects], project);
+  $('#fWho').innerHTML = options([['', 'Anyone'], ['__none', 'Unassigned'], ...S.assignees.map(n => [n, n === S.me ? `${n} (you)` : n])], who);
+  $('#projList').innerHTML = S.projects.map(p => `<option value="${esc(p.project)}">`).join('');
+  const f = $('#add');
+  f.assignee.innerHTML = assigneeOptions(f.assignee.value);
+  if (!f.project.value) f.project.value = project || (S.projects[0] && S.projects[0].project) || 'general';
+
+  let items = S.items;
+  if (who === '__none') items = items.filter(i => !i.assignee);
+  else if (who) items = items.filter(i => i.assignee === who);
+  $('#qIssue').innerHTML = queueHTML('Issues', 'var(--issue)', items.filter(i => i.kind === 'issue'), 'No open issues.');
+  $('#qTask').innerHTML = queueHTML('Tasks', 'var(--task)', items.filter(i => i.kind === 'task'), 'No open tasks.');
+
+  const open = S.items.filter(i => i.status !== 'done');
+  const forClaude = open.filter(i => i.assignee === 'claude' || i.assignee.startsWith('claude-')).length;
+  $('#stats').textContent = `${open.length} open · ${forClaude} queued for Claude`;
+  $('#acct').innerHTML = S.shared ? `· ${esc(S.me)} · <a href="/logout">Sign out</a>` : '';
+
+  $('#events').innerHTML = S.events.length ? S.events.map(e => `<div class="ev">
+      <b class="${e.actor === 'claude' ? 'claude' : ''}">${esc(e.actor)}</b> ${esc(e.action)}
+      <span class="ref">${esc(e.ref)}</span> ${esc(e.title)}${e.detail ? ` <span class="t">— ${esc(e.detail)}</span>` : ''}
+      <div class="t">${ago(e.at)}${project ? '' : ' · ' + esc(e.project)}</div></div>`).join('')
+    : '<div class="empty">No activity yet.</div>';
+}
+
+document.addEventListener('click', async e => {
+  const el = e.target.closest('[data-act]');
+  if (!el || el.tagName === 'SELECT') return;
+  const item = el.closest('.item'); const id = item && +item.dataset.id;
+  const it = id && S.items.find(i => i.id === id);
+  if (!it) return;
+  const act = el.dataset.act;
+  if (act === 'expand') { expanded.has(id) ? expanded.delete(id) : expanded.add(id); render(); return; }
+  if (act === 'toggle') await api('PATCH', `/api/items/${id}`, {status: it.status === 'done' ? 'open' : 'done'});
+  if (act === 'start') await api('PATCH', `/api/items/${id}`, {status: 'doing', ...(it.assignee ? {} : {assignee: S.me})});
+  if (act === 'pause') await api('PATCH', `/api/items/${id}`, {status: 'open'});
+  if (act === 'resolveNote') await api('PATCH', `/api/items/${id}`, {status: 'done', note: $('[data-f=note]', item).value});
+  if (act === 'comment') { const v = $('[data-f=comment]', item).value.trim(); if (!v) return; await api('POST', `/api/items/${id}/comment`, {text: v}); }
+  if (act === 'delete') { if (!confirm(`Delete ${it.ref} “${it.title}”? This can't be undone.`)) return; expanded.delete(id); await api('DELETE', `/api/items/${id}`); }
+  refresh(true);
+});
+
+document.addEventListener('change', async e => {
+  const el = e.target;
+  if (el.id === 'fProject') { project = el.value; saved.set('project', project); if (project) $('#add').project.value = project; return refresh(true); }
+  if (el.id === 'fWho') { who = el.value; saved.set('who', who); return render(); }
+  const item = el.closest('.item'); if (!item) return;
+  if (el.dataset.act === 'assign') await api('PATCH', `/api/items/${item.dataset.id}`, {assignee: el.value});
+  if (el.dataset.act === 'priority') await api('PATCH', `/api/items/${item.dataset.id}`, {priority: el.value});
+  refresh(true);
+});
+
+document.addEventListener('toggle', e => {
+  if (e.target.matches && e.target.matches('details.resolved')) saved.set('open.' + e.target.dataset.q, e.target.open ? '1' : '0');
+}, true);
+
+document.querySelectorAll('.seg button').forEach(b => b.addEventListener('click', () => {
+  kind = b.dataset.kind;
+  document.querySelectorAll('.seg button').forEach(x => x.classList.toggle('on', x === b));
+  $('#add').title.placeholder = `Add ${kind === 'task' ? 'a task' : 'an issue'}… (press Enter)`;
+  $('#add').title.focus();
+}));
+
+$('#add').addEventListener('submit', async e => {
+  e.preventDefault();
+  const f = e.target;
+  await api('POST', '/api/items', {kind, title: f.title.value, priority: f.priority.value,
+    assignee: f.assignee.value, tags: f.tags.value, project: f.project.value.trim()});
+  f.title.value = ''; f.tags.value = ''; f.title.focus();
+  refresh(true);
+});
+
+setInterval(tick, 4000);
+setInterval(() => { if (S && !document.hidden && !typing()) render(); }, 60000);  // keep "5m ago" fresh
+document.addEventListener('visibilitychange', tick);
+tick();
+</script>
+</body>
+</html>
+"""
+
+
+LOGIN_PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tiantasks</title>
+<style>
+:root { --bg: #f5f4f0; --panel: #fff; --ink: #1c1c1e; --muted: #6d6d72; --line: #e3e1db; --accent: #3651d4; --issue: #c62f2f; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #131315; --panel: #1c1c1f; --ink: #ececef; --muted: #9b9ba3; --line: #2d2d32; --accent: #8198ff; --issue: #ff7070; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 16px; background: var(--bg);
+  color: var(--ink); font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+form { width: 100%; max-width: 360px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  padding: 24px; display: grid; gap: 12px; }
+h1 { margin: 0; font-size: 20px; }
+p { margin: 0; color: var(--muted); }
+input, button { font: inherit; color: inherit; border-radius: 8px; padding: 9px 11px; }
+input { background: var(--bg); border: 1px solid var(--line); }
+button { background: var(--accent); color: #fff; border: 0; font-weight: 600; cursor: pointer; }
+.err { color: var(--issue); }
+.err:empty { display: none; }
+</style>
+</head>
+<body>
+<form method="post" action="/login">
+  <h1>Tiantasks</h1>
+  <p>Paste the access token you were given to open the shared board.</p>
+  <p class="err"><!--err--></p>
+  <input name="token" type="password" placeholder="Access token" aria-label="Access token" autocomplete="current-password" required autofocus>
+  <button>Sign in</button>
+</form>
+</body>
+</html>
+"""
+
+
+if __name__ == "__main__":
+    main()
