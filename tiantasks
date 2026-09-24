@@ -8,10 +8,13 @@ reports and closes work.
 """
 
 import argparse
+import base64
 import datetime as dt
 import getpass
+import hashlib
 import hmac
 import json
+import mimetypes
 import os
 import re
 import shutil
@@ -30,7 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
-VERSION = "2.6.0"
+VERSION = "2.7.0"
 DEFAULT_DB = Path.home() / ".tiantasks" / "tiantasks.db"
 CONFIG = Path.home() / ".tiantasks" / "config.json"
 DEFAULT_PORT = int(os.environ.get("TIANTASKS_PORT", 7777))
@@ -38,8 +41,8 @@ PRIORITIES = ("crit", "high", "med", "low")
 PRANK = {p: i for i, p in enumerate(PRIORITIES)}
 STATUSES = ("open", "doing", "done")
 AGENT_NAME = re.compile(r"[a-z0-9][a-z0-9_.-]{0,39}")
-IMAGE_TYPES = ("image/png", "image/jpeg", "image/webp", "image/gif")
-MAX_ATTACHMENT = 1_900_000  # D1 rows top out at 2 MB; the page shrinks screenshots to fit
+MAX_ATTACHMENT = 1_900_000  # a D1 row tops out at 2 MB; the page shrinks screenshots to fit
+INLINE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}  # shown inline; other files download
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -103,6 +106,15 @@ LEGACY_COMMENTS_SQL = """
 INSERT OR IGNORE INTO comments (item_id, ref, author, body, created_at, legacy_event_id)
   SELECT item_id, ref, actor, detail, at, id FROM events WHERE action = 'commented';
 """
+# Items come back with counts the board shows on cards: files, the first image (cover), comments.
+ITEM_SELECT = """SELECT items.*,
+  (SELECT COUNT(*) FROM attachments a WHERE a.item_id = items.id) AS files,
+  (SELECT MIN(a.id) FROM attachments a WHERE a.item_id = items.id AND a.mime LIKE 'image/%') AS cover,
+  (SELECT COUNT(*) FROM comments c WHERE c.deleted_at IS NULL
+     AND c.ref = (CASE items.kind WHEN 'task' THEN 'T-' ELSE 'I-' END) || items.num) AS comments
+FROM items"""
+ATT_COLS = "id, item_id, name, mime, size, created_by, created_at"
+
 # Comment events use these actions; history views hide them because comments have their own list.
 COMMENT_ACTIONS = ("commented", "added a comment", "replied", "deleted a comment")
 
@@ -190,9 +202,9 @@ class Store:
     def get(self, ref):
         kind, num = parse_ref(ref)
         if kind is None:
-            r = self.db.execute("SELECT * FROM items WHERE id=?", (num,)).fetchone()
+            r = self.db.execute(ITEM_SELECT + " WHERE items.id=?", (num,)).fetchone()
         else:
-            r = self.db.execute("SELECT * FROM items WHERE kind=? AND num=?", (kind, num)).fetchone()
+            r = self.db.execute(ITEM_SELECT + " WHERE kind=? AND num=?", (kind, num)).fetchone()
         if not r:
             raise TTError(f"no item {ref}", 404)
         item = self._row(r)
@@ -209,35 +221,50 @@ class Store:
                 {"id": r["id"], "name": r["name"], "mime": r["mime"], "size": r["size"]})
         return meta
 
+    @staticmethod
+    def _att(r):
+        d = dict(r)
+        d.pop("data", None)
+        d["url"] = f"/api/attachments/{d['id']}"
+        return d
+
     def attach(self, ref, actor, name, mime, data):
-        if mime not in IMAGE_TYPES:
-            raise TTError("only PNG, JPEG, WebP or GIF images can be attached", 415)
+        """Screenshots or any other file. Images are shown inline; other files download."""
         if not data:
-            raise TTError("the image is empty")
+            raise TTError("the file is empty")
         if len(data) > MAX_ATTACHMENT:
-            raise TTError(f"the image is {human_size(len(data))}; the limit is {human_size(MAX_ATTACHMENT)}", 413)
+            raise TTError(f"the file is {human_size(len(data))}; the limit is {human_size(MAX_ATTACHMENT)}", 413)
         name = clean_filename(name)
+        if not re.fullmatch(r"[\w.+-]+/[\w.+-]+", mime or ""):
+            mime = "application/octet-stream"
         with self.tx():
             it = self.get(ref)
             cur = self.db.execute(
                 "INSERT INTO attachments (item_id, name, mime, size, data, created_by, created_at)"
                 " VALUES (?,?,?,?,?,?,?)", (it["id"], name, mime, len(data), data, actor, now_iso()))
-            self._log(it, actor, "attached", name)
-        return {"id": cur.lastrowid, "name": name, "mime": mime, "size": len(data)}
+            self.db.execute("UPDATE items SET updated_at=? WHERE id=?", (now_iso(), it["id"]))
+            self._log(it, actor, "attached", f"{name} (#{cur.lastrowid})")  # the page shows #id inline
+            return self._att(self.db.execute(f"SELECT {ATT_COLS} FROM attachments WHERE id=?",
+                                             (cur.lastrowid,)).fetchone())
+
+    def attachments(self, ref):
+        it = self.get(ref)
+        return [self._att(r) for r in self.db.execute(
+            f"SELECT {ATT_COLS} FROM attachments WHERE item_id=? ORDER BY id", (it["id"],))]
 
     def attachment(self, att_id):
-        r = self.db.execute("SELECT * FROM attachments WHERE id=?", (att_id,)).fetchone()
+        r = self.db.execute("SELECT * FROM attachments WHERE id=?", (int(att_id),)).fetchone()
         if not r:
-            raise TTError("no such attachment", 404)
+            raise TTError(f"no attachment #{att_id}", 404)
         return dict(r)
 
-    def delete_attachment(self, att_id, actor):
+    def detach(self, att_id, actor):
         with self.tx():
             a = self.attachment(att_id)
             it = self.get(a["item_id"])
-            self.db.execute("DELETE FROM attachments WHERE id=?", (att_id,))
-            self._log(it, actor, "removed screenshot", a["name"])
-        return {"ok": True}
+            self.db.execute("DELETE FROM attachments WHERE id=?", (a["id"],))
+            self._log(it, actor, "detached", f"{a['name']} (#{a['id']})")
+        return self._att(a)
 
     def _log(self, item, actor, action, detail=""):
         self.db.execute(
@@ -384,7 +411,7 @@ class Store:
         return it
 
     def list(self, project=None, statuses=None, kind=None, assignee=None, grep=None):
-        sql, args = "SELECT * FROM items WHERE 1=1", []
+        sql, args = ITEM_SELECT + " WHERE 1=1", []
         if project:
             sql += " AND project=?"; args.append(project)
         if statuses:
@@ -461,7 +488,7 @@ class RemoteStore:
         self.url, self.token, self._me = url.rstrip("/"), token, None
         self.path = self.url
 
-    def _req(self, method, path, body=None, params=None):
+    def _req(self, method, path, body=None, params=None, raw=False):
         if params:
             path += "?" + urlencode({k: v for k, v in params.items() if v is not None})
         # Cloudflare's bot check blocks Python's default User-Agent (error 1010), so name ourselves.
@@ -473,7 +500,9 @@ class RemoteStore:
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.url + path, data=data, method=method, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=20, context=ssl_context()) as r:
+            with urllib.request.urlopen(req, timeout=60, context=ssl_context()) as r:
+                if raw:
+                    return {"data": r.read(), "mime": r.headers.get_content_type()}
                 return json.load(r)
         except urllib.error.HTTPError as e:
             try:
@@ -531,6 +560,16 @@ class RemoteStore:
 
     def version(self):
         return self._req("GET", "/api/version")["v"]
+
+    def attach(self, ref, actor, name, mime, data):
+        return self._req("POST", self._item(ref) + "/attachments", {
+            "name": name, "mime": mime, "data": base64.b64encode(data).decode()})
+
+    def attachments(self, ref):
+        return self._req("GET", self._item(ref) + "/attachments")
+
+    def attachment(self, att_id):
+        return self._req("GET", f"/api/attachments/{int(att_id)}", raw=True)
 
     def close(self):
         pass
@@ -626,7 +665,50 @@ def cmd_add(args, kind=None):
     it = args.store.create(kind, " ".join(args.text), current_project(args), current_actor(args),
                            body=args.desc or "", priority=args.priority or "",
                            tags=args.tag or [], assignee=assignee or "")
+    for path in args.file or []:
+        attach_file(args, it["ref"], path)
+    if args.file:
+        it = args.store.get(it["ref"])
     emit(args, it, "added")
+
+
+def attach_file(args, ref, path):
+    p = Path(path).expanduser()
+    try:
+        data = p.read_bytes()
+    except OSError as e:
+        raise TTError(f"can't read {path}: {e.strerror}")
+    mime = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+    return args.store.attach(ref, current_actor(args), p.name, mime, data)
+
+
+def cmd_attach(args):
+    for path in args.files:
+        a = attach_file(args, args.id, path)
+        if getattr(args, "json", False):
+            print(json.dumps(a, indent=2))
+            continue
+        info = dim("(#%s, %s)" % (a["id"], human_size(a["size"])))
+        print(f"{cyan('attached')} {a['name']} {info} to {args.id.upper()}")
+
+
+def cmd_files(args):
+    files = args.store.attachments(args.id)
+    if args.save:
+        out = Path(args.save).expanduser()
+        out.mkdir(parents=True, exist_ok=True)
+        for a in files:
+            dest = out / f"{a['id']}-{a['name']}"
+            dest.write_bytes(args.store.attachment(a["id"])["data"])
+            a["path"] = str(dest)
+    if args.json:
+        print(json.dumps(files, indent=2))
+        return
+    if not files:
+        print(dim(f"no files on {args.id.upper()}"))
+    for a in files:
+        where = a.get("path") or dim(a["mime"])
+        print(f"#{a['id']:<4} {a['name']}  {dim(human_size(a['size']))}  {where}")
 
 
 def cmd_resolve(args):
@@ -789,7 +871,7 @@ def cmd_next(args):
         return
     comments = comments_for(args.store, it)
     if args.json:
-        print(json.dumps({**it, "comments": comments}, indent=2))
+        print(json.dumps({**it, "comment_list": comments}, indent=2))
         return
     print(fmt(it, show_project=project is None))
     if it["body"]:
@@ -861,7 +943,7 @@ def cmd_show(args):
     history = args.store.events(100, item_id=it["id"])  # remote boards map this to the item's ref
     comments = args.store.comments(it["ref"])
     if args.json:
-        print(json.dumps({**it, "comments": comments, "history": history}, indent=2))
+        print(json.dumps({**it, "comment_list": comments, "history": history}, indent=2))
         return
     print(fmt(it))
     print(dim(f"  {it['kind']} · project {it['project']} · opened {show_ts(it['created_at'])}"
@@ -869,9 +951,9 @@ def cmd_show(args):
     if it["body"]:
         print("\n  " + it["body"].replace("\n", "\n  "))
     if it.get("attachments"):
-        print(dim("\n  screenshots (view them on the board):"))
+        print(dim(f"\n  files (download with `tt files {it['ref']} --save DIR`):"))
         for a in it["attachments"]:
-            print(f"    📎 {a['name']}  {dim(human_size(a['size']))}")
+            print(f"    📎 #{a['id']} {a['name']}  {dim(human_size(a['size']))}")
     if any(not c["deleted"] for c in comments):
         print(dim("\n  comments (reply: tt comment ID -r CID \"text\"):"))
         print_threads(comments, indent="    ")
@@ -973,6 +1055,8 @@ def make_handler(db_path, me, users=None):
             url = urlparse(self.path)
             if url.path == "/api/ping":
                 return self._send(200, {"app": "tiantasks", "version": VERSION})
+            if url.path == "/llms.txt":  # how agents drive the board over HTTP
+                return self._send(200, AGENT_GUIDE.encode(), "text/plain; charset=utf-8")
             if url.path == "/tiantasks":  # the CLI itself, so teammates can install it from here
                 return self._send(200, Path(os.path.realpath(__file__)).read_bytes(),
                                   "text/x-python; charset=utf-8")
@@ -1021,22 +1105,29 @@ def make_handler(db_path, me, users=None):
 
         def _route(self, method, path, q, store, user, actor, is_admin=False):
             ma = re.fullmatch(r"/api/items/([A-Za-z]?-?\d+)/attachments", path)
+            if method == "GET" and ma:
+                return self._send(200, store.attachments(ma.group(1)))
             if method == "POST" and ma:
                 n = int(self.headers.get("Content-Length") or 0)
-                if n > MAX_ATTACHMENT:
+                ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                if ctype == "application/json":  # {name, mime, data: base64} from the page and `tt attach`
+                    b = self._body()
+                    return self._send(201, store.attach(ma.group(1), actor, b.get("name", ""), b.get("mime", ""),
+                                                        base64.b64decode(b.get("data") or "")))
+                if n > MAX_ATTACHMENT:  # raw bytes, with ?name=
                     self.close_connection = True
-                    raise TTError(f"the image is {human_size(n)}; the limit is {human_size(MAX_ATTACHMENT)}", 413)
-                mime = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-                return self._send(201, store.attach(ma.group(1), actor, q.get("name"), mime, self.rfile.read(n)))
+                    raise TTError(f"the file is {human_size(n)}; the limit is {human_size(MAX_ATTACHMENT)}", 413)
+                return self._send(201, store.attach(ma.group(1), actor, q.get("name"), ctype, self.rfile.read(n)))
             mf = re.fullmatch(r"/api/attachments/(\d+)", path)
             if method == "GET" and mf:
                 a = store.attachment(int(mf.group(1)))
-                return self._send(200, a["data"], a["mime"], headers=[
-                    ("Cache-Control", "private, max-age=31536000, immutable"),
-                    ("Content-Security-Policy", "default-src 'none'"),
-                    ("X-Content-Type-Options", "nosniff")])
+                inline = a["mime"] in INLINE_TYPES
+                return self._send(200, bytes(a["data"]), a["mime"] if inline else "application/octet-stream", headers=[
+                    ("Cache-Control", "private, max-age=31536000, immutable"),  # ids are never reused
+                    ("Content-Security-Policy", "sandbox; default-src 'none'"),
+                    ("Content-Disposition", f"{'inline' if inline else 'attachment'}; filename*=UTF-8''{quote(a['name'])}")])
             if method == "DELETE" and mf:
-                return self._send(200, store.delete_attachment(int(mf.group(1)), actor))
+                return self._send(200, store.detach(int(mf.group(1)), actor))
             mc = re.fullmatch(r"/api/comments/(\d+)", path)
             if method == "DELETE" and mc:
                 return self._send(200, store.delete_comment(int(mc.group(1)), actor, is_admin))
@@ -1044,7 +1135,7 @@ def make_handler(db_path, me, users=None):
             if method == "GET" and path == "/":
                 return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
             if method == "GET" and path == "/api/version":
-                return self._send(200, {"v": store.version()})
+                return self._send(200, {"v": store.version(), "build": PAGE_BUILD})
             if method == "GET" and path == "/api/me":
                 return self._send(200, {"user": user, "actor": actor, "shared": users is not None,
                                         "admin": is_admin})
@@ -1058,6 +1149,7 @@ def make_handler(db_path, me, users=None):
                     "events": store.events(40, project),
                     "projects": store.projects(),
                     "assignees": sorted(set(store.assignees()) | people | agents),
+                    "people": sorted(people),
                 })
             if method == "GET" and path == "/api/items":
                 st = q.get("status")
@@ -1076,10 +1168,13 @@ def make_handler(db_path, me, users=None):
                 return self._send(200, store.events(200, ref=store.get(m.group(1))["ref"]))
             if method == "POST" and path == "/api/items":
                 b = self._body()
-                return self._send(201, store.create(
+                it = store.create(
                     b.get("kind", "task"), b.get("title", ""), b.get("project") or "general", actor,
                     body=b.get("body", ""), priority=b.get("priority", ""),
-                    tags=b.get("tags", []), assignee=b.get("assignee", "")))
+                    tags=b.get("tags", []), assignee=b.get("assignee", ""))
+                if b.get("status") in ("doing", "done"):  # the board's per-column "+" creates straight into it
+                    it = store.update(it["id"], actor, status=b["status"], note=b.get("note"))
+                return self._send(201, it)
             if method == "GET" and m and m.group(2) == "/comments":
                 return self._send(200, store.comments(m.group(1)))
             if method == "POST" and m and m.group(2) == "/comment":
@@ -1264,12 +1359,16 @@ are `claude-<user>` (for example `claude-oliver`), so each person's Claude has i
 | `tt issue "title" [same flags]` | New issue / bug |
 | `tt start ID` · `tt stop ID` | Mark in progress / back to open |
 | `tt resolve ID [ID…] -m "what you did"` | Check it off (shown struck through) with a resolution note |
-| `tt assign ID NAME` · `tt comment ID "text"` · `tt edit ID …` · `tt reopen ID` | Housekeeping |
-| `tt show ID` | Full details, comments, history and screenshot names (the images themselves are only viewable on the board) |
+| `tt assign ID NAME` · `tt edit ID …` · `tt reopen ID` | Housekeeping |
+| `tt show ID` | Full details, comment threads, files and history |
+| `tt comment ID "text"` · `tt comment ID -r CID "reply"` | Comment, or reply to comment CID (ids are shown by `tt show`) |
+| `tt files ID --save DIR` | Download an item's screenshots/files so you can open them (then Read the printed paths) |
+| `tt attach ID FILE…` · `tt issue "title" -f shot.png` | Attach screenshots or files (≤1.9 MB each) |
 
 ## Workflow
 
-1. **Asked to work the queue or "do your tasks":** run `tt next --start`, do the work, then
+1. **Asked to work the queue or "do your tasks":** run `tt next --start`, read it with `tt show ID`
+   (if it lists files, `tt files ID --save /tmp/tt-ID` and look at the screenshots), do the work, then
    `tt resolve <ID> -m "<one-line summary of the change>"`. Repeat until `tt next` comes back
    empty or the user says to stop.
 2. **You find a bug, failing test or tech debt you're not fixing now:**
@@ -1278,7 +1377,9 @@ are `claude-<user>` (for example `claude-oliver`), so each person's Claude has i
    if the user asked you to take it on. Assign teammates by name only when asked.
 4. **You finish something that matches an open item** (check `tt list`): resolve it with a note.
 5. Mention the IDs you opened or resolved in your reply.
-6. If `tt` says it can't reach the shared board or the token was rejected, tell the user; don't
+6. When a screenshot would show the problem or the result (UI work especially), attach it with
+   `tt attach ID path.png`; people see it inline on the ticket.
+7. If `tt` says it can't reach the shared board or the token was rejected, tell the user; don't
    fall back to editing anything by hand.
 
 Keep titles to one line and put details in `-d` or `tt comment`. Use `--json` when you need to
@@ -1305,6 +1406,46 @@ Several agents can share one board. Each has a name, set when its session starts
 2. Do the work, then `tt resolve ID -m "<what you did, where, how you verified it>"`.
 3. If you're blocked, `tt comment ID "blocked: <why>"` and `tt stop ID` so the lead sees it.
 4. Loop back to step 1 until told to stop.
+"""
+
+AGENT_GUIDE = """# Tiantasks
+
+Task and issue queues shared by people and AI agents. Items are tasks (T-n) or issues (I-n),
+grouped by project, with status open ("Not started") -> doing ("In progress") -> done ("Complete").
+
+Prefer the `tt` CLI (`tt help`; download it from /tiantasks). It handles identity for you, and
+`tt brief` / `tt next --wait --start` cover the lead-agent / worker-agent loop.
+
+## HTTP API
+Auth: `Authorization: Bearer <token>` on a shared board. Every non-GET request must also send
+`X-Tiantasks: 1`. Agents send `X-Tiantasks-Agent: claude` (acts as `claude-<user>`) or their own
+name, e.g. `X-Tiantasks-Agent: builder-1`. Bodies are JSON. Refs accept `T-3`, `I-12` or the numeric id.
+
+GET    /api/state?project=P             items + recent events + projects + assignees
+GET    /api/version                     change counter; poll this, refetch when it moves
+GET    /api/items?project=&status=open,doing&kind=task|issue&assignee=&grep=
+POST   /api/items                       {kind, title, project, body, priority, tags, assignee, status}
+GET    /api/items/REF                   one item (with files, cover, comments counts and attachments)
+PATCH  /api/items/REF                   any of {status, note, assignee, priority, title, body, tags, project}
+                                        plus optional guards {if_status, if_assignee}: 409 if the item changed
+DELETE /api/items/REF
+GET    /api/items/REF/events            history, newest first
+GET    /api/items/REF/comments          [{id, parent_id, author, body, at, deleted}] oldest first
+POST   /api/items/REF/comment           {text, parent_id?}   (Markdown; parent_id replies to a comment)
+DELETE /api/comments/ID                 admins only
+GET    /api/items/REF/attachments       file list: {id, name, mime, size, url}
+POST   /api/items/REF/attachments       {name, mime, data: base64}   (<= 1.9 MB decoded)
+GET    /api/attachments/ID              raw bytes
+DELETE /api/attachments/ID
+
+priority: crit | high | med | low | ""   status: open | doing | done (a "note" on done is the resolution)
+
+## Working an item
+1. Take it without racing other agents: PATCH {status: "doing", assignee: "<you>",
+   if_status: "<status you saw>", if_assignee: "<assignee you saw>"}; on 409, pick another item.
+2. Read the body, the comments and any screenshots before changing code.
+3. Post progress as comments (reply to questions with parent_id); attach screenshots of UI results.
+4. Finish: PATCH {status: "done", note: "<one line: what changed>"}.
 """
 
 CLAUDE_MD_SNIPPET = """
@@ -1370,6 +1511,7 @@ def build_parser():
         sp.add_argument("-t", "--tag", action="append", help="tag (repeatable)")
         sp.add_argument("-d", "--desc", help="longer description")
         sp.add_argument("--to", help="assignee (a name, 'claude' or 'me')")
+        sp.add_argument("-f", "--file", action="append", help="attach a file or screenshot (repeatable)")
         sp.add_argument("--json", action="store_true")
         if name == "add":
             sp.add_argument("-i", "--issue", action="store_true", help="make it an issue")
@@ -1430,6 +1572,16 @@ def build_parser():
     sp.add_argument("--timeout", type=int, metavar="SECS", help="with --wait, give up after this long")
     sp.add_argument("--interval", type=int, metavar="SECS", help="with --wait, how often to check")
     sp.add_argument("-A", "--all-projects", action="store_true")
+    sp.add_argument("--json", action="store_true")
+
+    sp = add_cmd("attach", cmd_attach, "attach screenshots or files to an item")
+    sp.add_argument("id", metavar="ID")
+    sp.add_argument("files", nargs="+", metavar="FILE")
+    sp.add_argument("--json", action="store_true")
+
+    sp = add_cmd("files", cmd_files, "list an item's attachments (--save DIR downloads them)")
+    sp.add_argument("id", metavar="ID")
+    sp.add_argument("--save", metavar="DIR", help="download them into DIR and print the paths")
     sp.add_argument("--json", action="store_true")
 
     sp = add_cmd("brief", cmd_brief, "board snapshot for a lead agent: unassigned, queued, in progress, done, team")
@@ -1495,302 +1647,597 @@ PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Tiantasks</title>
 <script>try { const t = localStorage.getItem('tt.theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch {}</script>
 <style>
 :root {
-  --bg: #f5f4f0; --panel: #ffffff; --ink: #1c1c1e; --muted: #6d6d72; --line: #e3e1db;
-  --chip: #eeede8; --accent: #3651d4; --issue: #c62f2f; --task: #1d6fc0; --ok: #2d8a45;
-  --warn: #b85a0b; --doing: #fff6e6; --shadow: 0 1px 2px rgba(0,0,0,.04);
+  --bg: #f5f4f0; --panel: #ffffff; --panel-2: #faf9f6; --ink: #1c1c1e; --muted: #6d6d72; --faint: #a4a3a0;
+  --line: #e3e1db; --line-2: #eeece6; --chip: #eeede8; --accent: #3651d4; --issue: #c62f2f; --task: #1d6fc0;
+  --ok: #2d8a45; --warn: #b85a0b; --doing: #fff6e6; --ai1: #6f5cff; --ai2: #1fa6e8;
+  --shadow: 0 1px 2px rgba(0,0,0,.04);
+  --shadow-2: 0 1px 2px rgba(20,20,30,.05), 0 6px 18px rgba(20,20,30,.07);
+  --shadow-3: 0 30px 80px rgba(20,20,30,.22), 0 4px 14px rgba(20,20,30,.08);
+  --ring: color-mix(in srgb, var(--accent) 40%, transparent);
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #111219; --panel: #191a24; --ink: #d4d8f0; --muted: #8189ad; --line: #2a2d40;
-    --chip: #232536; --accent: #8aa4ff; --issue: #ff7a93; --task: #7dcfff; --ok: #9ece6a;
-    --warn: #e5b567; --doing: #221f33; --shadow: none;
+    --bg: #111219; --panel: #191a24; --panel-2: #161722; --ink: #d4d8f0; --muted: #8189ad; --faint: #5d6385;
+    --line: #2a2d40; --line-2: #23263a; --chip: #232536; --accent: #8aa4ff; --issue: #ff7a93; --task: #7dcfff;
+    --ok: #9ece6a; --warn: #e5b567; --doing: #221f33; --ai1: #a992ff; --ai2: #56c7ff;
+    --shadow: none; --shadow-2: 0 1px 0 rgba(255,255,255,.03) inset, 0 6px 18px rgba(0,0,0,.35);
+    --shadow-3: 0 30px 80px rgba(0,0,0,.6);
   }
 }
 :root[data-theme="dark"] {
-  --bg: #111219; --panel: #191a24; --ink: #d4d8f0; --muted: #8189ad; --line: #2a2d40;
-  --chip: #232536; --accent: #8aa4ff; --issue: #ff7a93; --task: #7dcfff; --ok: #9ece6a;
-  --warn: #e5b567; --doing: #221f33; --shadow: none;
+    --bg: #111219; --panel: #191a24; --panel-2: #161722; --ink: #d4d8f0; --muted: #8189ad; --faint: #5d6385;
+    --line: #2a2d40; --line-2: #23263a; --chip: #232536; --accent: #8aa4ff; --issue: #ff7a93; --task: #7dcfff;
+    --ok: #9ece6a; --warn: #e5b567; --doing: #221f33; --ai1: #a992ff; --ai2: #56c7ff;
+    --shadow: none; --shadow-2: 0 1px 0 rgba(255,255,255,.03) inset, 0 6px 18px rgba(0,0,0,.35);
+    --shadow-3: 0 30px 80px rgba(0,0,0,.6);
 }
 :root { color-scheme: light dark; }
 :root[data-theme="light"] { color-scheme: light; }
 :root[data-theme="dark"] { color-scheme: dark; }
 * { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
 body { margin: 0; background: var(--bg); color: var(--ink);
   font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
 select, input, textarea, button { font: inherit; color: inherit; }
 select, input, textarea { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 6px 9px; min-width: 0; }
-input:focus, select:focus { outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent); outline-offset: -1px; }
+textarea { resize: vertical; }
+input:focus, select:focus, textarea:focus { outline: 2px solid var(--ring); outline-offset: -1px; }
 button { cursor: pointer; border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 6px 11px; }
 button:hover { border-color: var(--muted); }
+button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--ring); outline-offset: 1px; }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+button.primary:hover { filter: brightness(1.08); }
+button.ghost { border-color: transparent; background: none; color: var(--muted); }
+button.ghost:hover { color: var(--ink); background: var(--chip); }
 button.link { border: 0; background: none; padding: 2px 4px; color: var(--muted); font-size: 12px; }
 button.link:hover { color: var(--ink); }
 button.danger { color: var(--issue); }
+.i { width: 16px; height: 16px; flex: none; vertical-align: -3px; }
+.icon-btn { display: inline-grid; place-items: center; width: 30px; height: 30px; padding: 0; border-color: transparent; background: none; color: var(--muted); }
+.icon-btn:hover { background: var(--chip); color: var(--ink); border-color: transparent; }
+.grow { flex: 1; }
+.ref { font: 12px var(--mono); color: var(--muted); flex: none; }
+code { font: 12px var(--mono); background: var(--chip); padding: 1px 5px; border-radius: 4px; }
+kbd { font: 11px var(--mono); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; color: var(--muted); background: var(--panel); }
 
-header { position: sticky; top: 0; z-index: 5; background: color-mix(in srgb, var(--panel) 92%, transparent);
-  backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
-.bar { max-width: 1320px; margin: 0 auto; padding: 12px 20px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
-h1 { font-size: 18px; margin: 0 8px 0 0; letter-spacing: -0.01em; display: flex; align-items: center; gap: 8px; }
-.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
-.dot.off { background: var(--issue); }
-.spacer { flex: 1; }
+/* ---------- header */
+header { position: sticky; top: 0; z-index: 5; background: color-mix(in srgb, var(--panel) 90%, transparent);
+  backdrop-filter: saturate(1.4) blur(10px); -webkit-backdrop-filter: saturate(1.4) blur(10px); border-bottom: 1px solid var(--line); }
+.bar { max-width: 1440px; margin: 0 auto; padding: 10px 20px; display: flex; flex-wrap: wrap; gap: 10px 12px; align-items: center; }
+h1 { font-size: 17px; margin: 0 4px 0 0; letter-spacing: -0.015em; display: flex; align-items: center; gap: 8px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 20%, transparent); }
+.dot.off { background: var(--issue); box-shadow: 0 0 0 3px color-mix(in srgb, var(--issue) 20%, transparent); }
+.views { display: inline-flex; padding: 3px; gap: 2px; background: var(--chip); border-radius: 10px; }
+.views button { border: 0; background: none; border-radius: 7px; padding: 5px 12px; display: inline-flex; gap: 6px; align-items: center; color: var(--muted); font-weight: 500; }
+.views button.on { background: var(--panel); color: var(--ink); box-shadow: 0 1px 2px rgba(0,0,0,.08), 0 0 0 1px var(--line); }
+.views .n { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.search { position: relative; display: flex; align-items: center; flex: 0 1 240px; }
+.search .i { position: absolute; left: 9px; color: var(--muted); pointer-events: none; }
+.search input { width: 100%; padding-left: 30px; padding-right: 28px; }
+.search kbd { position: absolute; right: 8px; }
+.search input:focus + kbd, .search input:not(:placeholder-shown) + kbd { display: none; }
 .stats { color: var(--muted); font-size: 13px; }
 label.f { display: flex; gap: 6px; align-items: center; color: var(--muted); font-size: 13px; }
+label.f select { max-width: 170px; }
+#acct a { color: inherit; }
 
-main { max-width: 1320px; margin: 0 auto; padding: 18px 20px 40px; display: grid; gap: 18px;
-  grid-template-columns: minmax(0,1fr) minmax(0,1fr) 300px; align-items: start; }
-@media (max-width: 1080px) { main { grid-template-columns: minmax(0,1fr) minmax(0,1fr); } aside { grid-column: 1 / -1; } }
-@media (max-width: 720px) { main { grid-template-columns: minmax(0,1fr); padding: 14px 16px 32px; } .bar { padding: 10px 16px; } }
-
+/* ---------- compose */
+.wrap { max-width: 1440px; margin: 0 auto; padding: 16px 20px 40px; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); min-width: 0; }
-dialog { color: var(--ink); }
-#newDlg { width: min(640px, calc(100vw - 32px)); max-height: calc(100vh - 32px); padding: 0; border: 1px solid var(--line);
-  border-radius: 14px; background: var(--panel); box-shadow: 0 20px 60px rgba(0,0,0,.25); }
-#newDlg::backdrop { background: rgba(0,0,0,.35); }
-#add { display: grid; gap: 14px; padding: 20px; }
-.dlg-head { display: flex; align-items: center; gap: 12px; }
-.dlg-head h2 { margin: 0; font-size: 17px; flex: 1; }
-.fld { display: grid; gap: 5px; font-size: 13px; color: var(--muted); min-width: 0; }
-.fld input, .fld textarea, .fld select { color: var(--ink); width: 100%; }
-.fld textarea { resize: vertical; min-height: 96px; font: inherit; }
-.row4 { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
-.drop { border: 1.5px dashed var(--line); border-radius: 10px; padding: 12px; display: grid; gap: 10px; }
-.drop.over { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
-.drop p { margin: 0; font-size: 13px; color: var(--muted); }
-.drop .link { font-size: 13px; color: var(--accent); padding: 0; }
-.thumbs { display: flex; flex-wrap: wrap; gap: 8px; }
-.thumbs:empty { display: none; }
-.thumb { position: relative; margin: 0; width: 96px; height: 72px; border-radius: 8px; overflow: hidden;
-  border: 1px solid var(--line); background: var(--chip); }
-.thumb img { width: 100%; height: 100%; object-fit: cover; display: block; cursor: zoom-in; }
-.thumb .x { position: absolute; top: 3px; right: 3px; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 50%;
-  background: rgba(0,0,0,.6); color: #fff; font-size: 13px; line-height: 20px; }
-.err { margin: 0; color: var(--issue); font-size: 13px; }
-.err:empty { display: none; }
-.dlg-foot { display: flex; gap: 8px; align-items: center; justify-content: flex-end; }
-.dlg-foot .kbd { margin-right: auto; font-size: 12px; color: var(--muted); }
-#lightbox { padding: 0; border: 0; background: transparent; max-width: 96vw; max-height: 96vh; }
-#lightbox::backdrop { background: rgba(0,0,0,.75); }
-#lightbox img { display: block; max-width: 96vw; max-height: 92vh; border-radius: 8px; cursor: zoom-out; }
+form.add { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px; align-items: center; margin-bottom: 16px; }
+form.add input[name=title] { flex: 1 1 260px; border-color: transparent; background: none; font-size: 15px; }
+form.add input[name=title]:focus { outline: none; }
+form.add:focus-within { box-shadow: 0 0 0 3px var(--ring); border-color: color-mix(in srgb, var(--accent) 50%, var(--line)); }
+form.add input[name=tags] { width: 110px; }
+form.add input[name=project] { width: 140px; }
 .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; flex: none; }
 .seg button { border: 0; border-radius: 0; padding: 6px 12px; background: transparent; }
 .seg button.on[data-kind=task] { background: var(--task); color: #fff; }
 .seg button.on[data-kind=issue] { background: var(--issue); color: #fff; }
 
-.qh { display: flex; align-items: center; gap: 8px; padding: 14px 16px 10px; }
-.qh h2 { font-size: 15px; margin: 0; }
-.qh .sw { width: 10px; height: 10px; border-radius: 3px; }
-.count { color: var(--muted); font-size: 13px; }
-.empty { padding: 18px 16px 22px; color: var(--muted); border-top: 1px solid var(--line); }
-
-.item { border-top: 1px solid var(--line); padding: 10px 14px 10px 16px; }
-.item.doing { background: var(--doing); box-shadow: inset 3px 0 0 var(--warn); }
-.row { display: flex; gap: 10px; align-items: flex-start; }
-.check { width: 18px; height: 18px; flex: none; margin-top: 1px; padding: 0; border: 1.5px solid var(--muted);
-  border-radius: 5px; background: none; display: grid; place-items: center; font-size: 12px; line-height: 1; color: #fff; }
-.check:hover { border-color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }
-.done .check { background: var(--ok); border-color: var(--ok); }
-.ref { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); flex: none; margin-top: 2px; }
-.title { flex: 1; min-width: 0; cursor: pointer; overflow-wrap: anywhere; }
-.title:hover { color: var(--accent); }
-.done .title { text-decoration: line-through; color: var(--muted); }
-.meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 6px 0 0 28px; }
+/* ---------- small visual atoms */
+.si { width: 15px; height: 15px; flex: none; }
+.si-open { color: var(--faint); } .si-doing { color: var(--warn); } .si-done { color: var(--ok); }
+.pi { width: 15px; height: 15px; flex: none; }
+.pi-crit { color: var(--issue); } .pi-high { color: var(--ink); } .pi-med { color: var(--ink); } .pi-low { color: var(--ink); }
+.av { width: 22px; height: 22px; border-radius: 50%; display: inline-grid; place-items: center; flex: none;
+  font-size: 10px; font-weight: 700; color: #fff; letter-spacing: .02em; user-select: none; }
+.av.lg { width: 26px; height: 26px; font-size: 11px; }
+.av.none { border: 1.5px dashed var(--faint); background: none; }
+.av.ai { background: linear-gradient(135deg, var(--ai1), var(--ai2)); }
+.av.ai .i { width: 13px; height: 13px; fill: #fff; stroke: none; }
+.kind-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+.kind-dot.task { background: var(--task); } .kind-dot.issue { background: var(--issue); }
 .pill { font-size: 12px; padding: 1px 8px; border-radius: 999px; background: var(--chip); color: var(--muted); white-space: nowrap; }
 .pill.p-crit { background: var(--issue); color: #fff; }
-.pill.p-high { background: color-mix(in srgb, var(--issue) 16%, transparent); color: var(--issue); }
-.pill.p-med { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
 .pill.st { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); font-weight: 600; }
-.pill.who { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); }
-.meta select { font-size: 12px; padding: 1px 6px; border-radius: 999px; }
-.note { margin: 6px 0 0 28px; font-size: 13px; color: var(--muted); }
-.note::before { content: "✓ "; color: var(--ok); }
+.cnt { display: inline-flex; align-items: center; gap: 3px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.cnt .i { width: 13px; height: 13px; }
 
-.detail { margin: 10px 0 2px 28px; display: grid; gap: 10px; }
-.detail .body { white-space: pre-wrap; font-size: 13px; }
-.detail .inline { display: flex; gap: 6px; flex-wrap: wrap; }
-.detail .inline input { flex: 1 1 180px; }
-.comments { display: grid; gap: 8px; }
-.comments h3, .detail h3 { margin: 0; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
-.thread { display: grid; gap: 6px; }
-.cmt .cacts { float: right; display: flex; gap: 2px; opacity: .6; }
-.cmt:hover .cacts, .cmt:focus-within .cacts { opacity: 1; }
-.cmt.deleted { font-style: italic; color: var(--muted); }
-.fold { justify-self: start; display: flex; align-items: center; gap: 6px; margin-left: 12px; padding: 0 6px 2px 0;
-  border: 0; background: none; color: var(--accent); font-size: 12px; }
-.fold .fline { width: 14px; height: 12px; margin-top: -10px; border-left: 2px solid var(--line);
-  border-bottom: 2px solid var(--line); border-bottom-left-radius: 7px; }
-.fold:hover .fline { border-color: var(--accent); }
-.replies { display: grid; gap: 6px; margin-left: 12px; padding-left: 14px; border-left: 2px solid var(--line); }
-.replybox { margin-left: 26px; }
-.icon { padding: 4px 10px; min-width: 36px; }
-.cmt { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; font-size: 13px; }
-.cmt .by { font-size: 12px; color: var(--muted); margin-bottom: 2px; }
-.cmt .by b { color: var(--ink); font-weight: 600; }
-.cmt .txt { white-space: pre-wrap; overflow-wrap: anywhere; }
-.hist { font-size: 12px; color: var(--muted); display: grid; gap: 3px; max-height: 220px; overflow: auto; }
-.hist b { color: var(--ink); font-weight: 600; }
-
-details.resolved > summary { list-style: none; cursor: pointer; padding: 10px 16px; border-top: 1px solid var(--line);
-  color: var(--muted); font-size: 13px; }
-details.resolved > summary::-webkit-details-marker { display: none; }
-details.resolved > summary::before { content: "▸ "; }
-details.resolved[open] > summary::before { content: "▾ "; }
-
-aside h2 { font-size: 15px; margin: 0; padding: 14px 16px 10px; }
-.ev { border-top: 1px solid var(--line); padding: 8px 16px; font-size: 13px; overflow-wrap: anywhere; }
+/* ---------- queues view */
+.qtabs { display: flex; gap: 4px; margin: 0 0 14px; border-bottom: 1px solid var(--line); overflow-x: auto; scrollbar-width: none; }
+.qtabs::-webkit-scrollbar { display: none; }
+.tab { border: 0; background: none; border-radius: 0; padding: 8px 12px 10px; color: var(--muted); font-weight: 500;
+  display: inline-flex; gap: 7px; align-items: center; box-shadow: inset 0 -2px 0 transparent; white-space: nowrap; }
+.tab:hover { color: var(--ink); }
+.tab.on { color: var(--ink); box-shadow: inset 0 -2px 0 var(--accent); }
+.tab .n { font-size: 11px; background: var(--chip); border-radius: 999px; padding: 0 7px; font-variant-numeric: tabular-nums; }
+.qgrid { display: grid; gap: 16px; grid-template-columns: minmax(0,1fr) minmax(0,1fr) 300px; align-items: start; }
+@media (max-width: 1080px) { .qgrid { grid-template-columns: minmax(0,1fr) minmax(0,1fr); } .qgrid aside { grid-column: 1 / -1; } }
+@media (max-width: 720px) { .qgrid { grid-template-columns: minmax(0,1fr); } }
+.qh { display: flex; align-items: center; gap: 8px; padding: 12px 14px 10px; }
+.qh h2 { font-size: 14px; margin: 0; }
+.qh .sw { width: 10px; height: 10px; border-radius: 3px; }
+.count { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.empty { padding: 18px 16px 22px; color: var(--muted); border-top: 1px solid var(--line); font-size: 13px; }
+.item { border-top: 1px solid var(--line-2); padding: 8px 12px 8px 14px; display: grid; grid-template-columns: auto auto minmax(0,1fr) auto;
+  gap: 4px 10px; align-items: center; cursor: pointer; transition: background .12s; }
+.item:hover { background: var(--panel-2); }
+.item.doing { background: var(--doing); box-shadow: inset 3px 0 0 var(--warn); }
+.check { width: 18px; height: 18px; flex: none; padding: 0; border: 1.5px solid var(--faint); border-radius: 5px; background: none;
+  display: grid; place-items: center; color: #fff; }
+.check .i { width: 12px; height: 12px; stroke-width: 3; }
+.check:hover { border-color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }
+.done .check { background: var(--ok); border-color: var(--ok); }
+.item .title { min-width: 0; overflow-wrap: anywhere; }
+.item:hover .title { color: var(--accent); }
+.done .title { text-decoration: line-through; color: var(--muted); }
+.row-meta { grid-column: 3 / -1; display: flex; gap: 6px 8px; align-items: center; flex-wrap: wrap; margin-top: -1px; }
+.row-end { display: flex; gap: 8px; align-items: center; }
+.row-end .quick { opacity: 0; transition: opacity .12s; }
+.item:hover .quick, .item:focus-within .quick { opacity: 1; }
+.item .note { grid-column: 3 / -1; font-size: 13px; color: var(--muted); }
+.item .note::before { content: "✓ "; color: var(--ok); }
+@media (hover: none) { .row-end .quick { opacity: 1; } }
+aside h2 { font-size: 14px; margin: 0; padding: 12px 14px 10px; }
+.ev { border-top: 1px solid var(--line-2); padding: 8px 14px; font-size: 13px; overflow-wrap: anywhere; cursor: pointer; }
+.ev:hover { background: var(--panel-2); }
 .ev .t { color: var(--muted); font-size: 12px; }
 .ev b { font-weight: 600; }
-.ev .claude { color: var(--accent); }
-.hint { padding: 12px 16px 16px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); }
-#acct a { color: inherit; }
-code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--chip); padding: 1px 5px; border-radius: 4px; }
+.ev .ai { background: linear-gradient(90deg, var(--ai1), var(--ai2)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.hint { padding: 12px 14px 14px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+
+/* ---------- board view */
+.btool { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+.chips { display: inline-flex; gap: 4px; }
+.chip { border-radius: 999px; padding: 4px 11px; font-size: 13px; color: var(--muted); background: none; }
+.chip.on { background: var(--ink); color: var(--panel); border-color: var(--ink); }
+.board { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; align-items: start; }
+.col { background: color-mix(in srgb, var(--chip) 55%, transparent); border: 1px solid var(--line-2); border-radius: 14px;
+  display: flex; flex-direction: column; min-height: 200px; max-height: calc(100vh - 190px); min-width: 0; }
+.col-h { display: flex; align-items: center; gap: 8px; padding: 10px 10px 8px 14px; }
+.col-h h2 { font-size: 13px; margin: 0; font-weight: 600; }
+.col-body { padding: 2px 8px 10px; display: flex; flex-direction: column; gap: 8px; overflow-y: auto; flex: 1; min-height: 60px;
+  border-radius: 0 0 14px 14px; transition: background .12s, box-shadow .12s; }
+.col-body.over { background: color-mix(in srgb, var(--accent) 8%, transparent); box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent); }
+.col-empty { color: var(--faint); font-size: 13px; text-align: center; padding: 22px 8px; border: 1.5px dashed var(--line); border-radius: 10px; }
+.kcard { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 11px; box-shadow: var(--shadow);
+  cursor: pointer; display: grid; gap: 7px; position: relative; transition: box-shadow .15s, transform .15s, border-color .15s; }
+.kcard:hover { box-shadow: var(--shadow-2); border-color: color-mix(in srgb, var(--muted) 40%, var(--line)); }
+.kcard.dragging { opacity: .45; transform: rotate(1.5deg) scale(.98); }
+.kcard .cover { display: block; width: calc(100% + 22px); margin: -10px -11px 0; height: 128px; object-fit: cover; object-position: top;
+  border-radius: 9px 9px 0 0; border-bottom: 1px solid var(--line-2); background: var(--chip); }
+.kc-top { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.kc-title { font-size: 14px; line-height: 1.35; overflow-wrap: anywhere; font-weight: 500; }
+.kcard.done .kc-title { color: var(--muted); }
+.kc-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.kc-meta .tag { font-size: 11px; color: var(--muted); background: var(--chip); border-radius: 5px; padding: 0 6px; }
+.kc-meta .age { font-size: 11px; color: var(--faint); margin-left: auto; }
+.kc-note { font-size: 12px; color: var(--muted); border-left: 2px solid var(--ok); padding-left: 7px; overflow-wrap: anywhere; }
+.kcard.live::before { content: ""; position: absolute; inset: -1px; border-radius: 11px; padding: 1.5px; pointer-events: none;
+  background: linear-gradient(120deg, var(--ai1), var(--ai2), var(--ai1)); background-size: 200% 100%;
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor; mask-composite: exclude;
+  animation: flow 3s linear infinite; }
+@keyframes flow { to { background-position: 200% 0; } }
+@media (prefers-reduced-motion: reduce) { .kcard.live::before { animation: none; } }
+.working .i { fill: var(--ai1); stroke: none; width: 12px; height: 12px; }
+.working { font-size: 11px; font-weight: 600; display: inline-flex; align-items: center; gap: 4px;
+  background: linear-gradient(90deg, var(--ai1), var(--ai2)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+form.col-add { background: var(--panel); border: 1px solid var(--accent); border-radius: 10px; padding: 8px; display: grid; gap: 8px; box-shadow: 0 0 0 3px var(--ring); }
+form.col-add textarea { border: 0; padding: 2px; background: none; resize: none; font-size: 14px; }
+form.col-add textarea:focus { outline: none; }
+form.col-add .row { display: flex; gap: 6px; justify-content: flex-end; align-items: center; }
+.more { background: none; border: 1px dashed var(--line); color: var(--muted); font-size: 12px; }
+@media (max-width: 900px) {
+  .board { display: flex; overflow-x: auto; scroll-snap-type: x mandatory; gap: 12px; margin: 0 -20px; padding: 0 20px 8px; scrollbar-width: none; }
+  .board::-webkit-scrollbar { display: none; }
+  .col { flex: 0 0 min(86vw, 380px); scroll-snap-align: center; max-height: none; }
+}
+@media (max-width: 720px) {
+  .bar { padding: 9px 16px; } .wrap { padding: 12px 16px 32px; }
+  .board { margin: 0 -16px; padding: 0 16px 8px; }
+  .search { flex: 1 1 100%; order: 9; }
+  label.f span { display: none; }
+  #stats { display: none; }
+  form.add:not(.expanded) > :not(input[name=title]):not(.primary) { display: none; }
+  form.add:not(.expanded) input[name=title] { flex-basis: 0; }
+  form.add input[name=tags], form.add input[name=project] { width: calc(50% - 4px); }
+}
+
+/* ---------- modal */
+dialog { border: 0; padding: 0; background: none; color: inherit; max-width: none; max-height: none; }
+dialog::backdrop { background: rgba(15, 15, 20, .42); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); }
+#modal[open] { animation: pop .16s ease-out; }
+@keyframes pop { from { opacity: 0; transform: translateY(8px) scale(.985); } }
+.m-wrap { width: min(1040px, calc(100vw - 32px)); height: min(820px, calc(100vh - 48px)); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow-3); display: flex; flex-direction: column; overflow: hidden; }
+.m-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px 10px 18px; border-bottom: 1px solid var(--line-2); flex: none; }
+.kind-badge { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; padding: 2px 7px; border-radius: 5px; }
+.kind-badge.task { color: var(--task); background: color-mix(in srgb, var(--task) 12%, transparent); }
+.kind-badge.issue { color: var(--issue); background: color-mix(in srgb, var(--issue) 12%, transparent); }
+.crumb { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.m-titlebar { padding: 14px 26px 2px 20px; flex: none; }
+.m-body { display: grid; grid-template-columns: minmax(0, 1fr) 290px; flex: 1; min-height: 0; }
+.m-main { overflow-y: auto; padding: 6px 26px 28px; min-width: 0; }
+.m-side { overflow-y: auto; border-left: 1px solid var(--line-2); background: var(--panel-2); padding: 16px; display: grid; gap: 16px; align-content: start; }
+textarea.m-title { width: 100%; border: 0; background: none; font-size: 22px; font-weight: 650; letter-spacing: -0.015em; line-height: 1.25;
+  padding: 4px 6px; margin: 0; resize: none; overflow: hidden; border-radius: 8px; }
+textarea.m-title:hover { background: var(--panel-2); }
+textarea.m-title:focus { background: var(--panel-2); }
+.sec { margin-top: 22px; }
+.sec-h { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin-bottom: 8px; }
+.md { font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; border-radius: 8px; padding: 6px 8px; margin: 0 -8px; cursor: text; min-height: 34px; }
+.md:hover { background: var(--panel-2); }
+.md.placeholder { color: var(--faint); }
+.md p, .md ul, .md ol, .md pre, .md blockquote, .md h4 { margin: 0 0 .6em; }
+.md > :last-child { margin-bottom: 0; }
+.md h4 { font-size: 15px; }
+.md ul, .md ol { padding-left: 1.4em; }
+.md pre { background: var(--chip); padding: 10px 12px; border-radius: 8px; overflow-x: auto; }
+.md pre code { background: none; padding: 0; }
+.md blockquote { border-left: 3px solid var(--line); padding-left: 10px; color: var(--muted); }
+.md a { color: var(--accent); }
+.md img { max-width: 100%; border-radius: 8px; }
+.editor { display: grid; gap: 8px; }
+.editor textarea { width: 100%; min-height: 160px; line-height: 1.55; background: var(--panel); }
+.editor .row { display: flex; gap: 8px; align-items: center; }
+.editor .help { font-size: 12px; color: var(--faint); }
+.gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+.thumb { position: relative; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--chip); aspect-ratio: 4 / 3; padding: 0; display: block; width: 100%; }
+.thumb img { width: 100%; height: 100%; object-fit: cover; object-position: top; display: block; transition: transform .25s; }
+.thumb:hover img { transform: scale(1.03); }
+.thumb .cap { position: absolute; left: 0; right: 0; bottom: 0; padding: 14px 8px 5px; font-size: 11px; color: #fff; text-align: left;
+  background: linear-gradient(transparent, rgba(0,0,0,.6)); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: 0; transition: opacity .15s; }
+.thumb:hover .cap, .thumb:focus-visible .cap { opacity: 1; }
+.tile { position: relative; min-width: 0; }
+.tile .filechip { padding-right: 38px; }
+.tile .del { position: absolute; top: 6px; right: 6px; width: 24px; height: 24px; border-radius: 7px; padding: 0; display: grid; place-items: center;
+  background: rgba(0,0,0,.55); color: #fff; border: 0; opacity: 0; transition: opacity .15s; }
+.tile .del .i { width: 13px; height: 13px; }
+.tile:hover .del, .tile:focus-within .del { opacity: 1; }
+@media (hover: none) { .tile .del, .thumb .cap { opacity: 1; } }
+.filechip { display: flex; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; font-size: 13px;
+  color: inherit; text-decoration: none; background: var(--panel); min-width: 0; }
+.filechip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drop { border: 1.5px dashed var(--line); border-radius: 10px; display: grid; place-items: center; text-align: center; gap: 4px; padding: 14px;
+  color: var(--muted); font-size: 12px; cursor: pointer; aspect-ratio: 4 / 3; background: none; width: 100%; }
+.drop:hover { border-color: var(--accent); color: var(--accent); }
+.drop.wide { aspect-ratio: auto; padding: 18px; grid-auto-flow: column; gap: 8px; }
+.uploading { display: grid; place-items: center; aspect-ratio: 4 / 3; border-radius: 10px; background: var(--chip); color: var(--muted); font-size: 12px; animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .55; } }
+.m-wrap.dropping::after { content: "Drop to attach"; position: absolute; inset: 8px; border: 2px dashed var(--accent); border-radius: 12px;
+  display: grid; place-items: center; font-size: 18px; font-weight: 600; color: var(--accent); background: color-mix(in srgb, var(--panel) 80%, transparent); pointer-events: none; }
+.m-wrap { position: relative; }
+.tl { display: grid; gap: 2px; margin-top: 4px; }
+.tl-ev { display: flex; gap: 10px; align-items: flex-start; font-size: 13px; color: var(--muted); padding: 5px 0; }
+.tl-ev .bul { width: 22px; display: grid; place-items: center; flex: none; padding-top: 2px; }
+.tl-ev .bul i { width: 7px; height: 7px; border-radius: 50%; background: var(--line); display: block; margin-top: 4px; }
+.tl-ev b { color: var(--ink); font-weight: 600; }
+.tl-ev .when { color: var(--faint); }
+.tl-ev .quote { display: block; color: var(--ink); margin-top: 2px; }
+.tl-shot { display: block; margin-top: 6px; max-width: 280px; border-radius: 8px; border: 1px solid var(--line); overflow: hidden; padding: 0; background: var(--chip); }
+.tl-shot img { display: block; max-width: 100%; max-height: 200px; object-fit: cover; object-position: top; }
+.cmt { display: flex; gap: 10px; padding: 8px 0; }
+.cmt .bubble { flex: 1; min-width: 0; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); overflow: hidden; }
+.cmt .who { display: flex; gap: 6px; align-items: baseline; font-size: 13px; padding: 7px 12px 0; }
+.cmt .who b { font-weight: 600; }
+.cmt .who .when { color: var(--faint); font-size: 12px; }
+.cmt .md { margin: 0; padding: 4px 12px 9px; cursor: auto; min-height: 0; }
+.cmt .md:hover { background: none; }
+.cmt.ai .bubble { border-color: color-mix(in srgb, var(--ai1) 35%, var(--line)); background: color-mix(in srgb, var(--ai1) 4%, var(--panel)); }
+.thread { display: grid; }
+.cmt .cacts { display: flex; gap: 2px; opacity: .55; margin-left: auto; }
+.cmt:hover .cacts, .cmt:focus-within .cacts { opacity: 1; }
+.cmt.deleted .md { color: var(--faint); font-style: italic; padding: 7px 12px; }
+.cmt.reply { padding: 5px 0; }
+.fold { justify-self: start; display: flex; align-items: center; gap: 6px; margin: -2px 0 4px 15px; padding: 0 6px 2px 0;
+  border: 0; background: none; color: var(--accent); font-size: 12px; }
+.fold .fline { width: 16px; height: 12px; margin-top: -10px; border-left: 2px solid var(--line); border-bottom: 2px solid var(--line);
+  border-bottom-left-radius: 8px; }
+.fold:hover .fline { border-color: var(--accent); }
+.replies { margin: 0 0 4px 15px; padding-left: 18px; border-left: 2px solid var(--line); }
+.replybox { margin: 2px 0 8px 33px; }
+.composer { display: flex; gap: 10px; margin-top: 10px; }
+.composer .box { flex: 1; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); overflow: hidden; }
+.composer .box:focus-within { box-shadow: 0 0 0 3px var(--ring); border-color: color-mix(in srgb, var(--accent) 50%, var(--line)); }
+.composer textarea { width: 100%; border: 0; min-height: 64px; resize: none; background: none; padding: 10px 12px 4px; }
+.composer textarea:focus { outline: none; }
+.composer .row { display: flex; align-items: center; gap: 6px; padding: 4px 6px 6px 8px; }
+.composer .help { font-size: 11px; color: var(--faint); }
+.prop { display: grid; gap: 6px; }
+.prop > label, .prop > .lbl { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+.prop select, .prop input, .prop textarea { width: 100%; background: var(--panel); }
+.stseg { display: grid; grid-template-columns: repeat(3, 1fr); background: var(--chip); padding: 3px; border-radius: 10px; gap: 2px; }
+.stseg button { border: 0; background: none; border-radius: 7px; padding: 6px 2px; font-size: 12px; display: grid; justify-items: center; gap: 3px; color: var(--muted); }
+.stseg button.on { background: var(--panel); color: var(--ink); box-shadow: 0 1px 2px rgba(0,0,0,.08), 0 0 0 1px var(--line); font-weight: 600; }
+.resolve-row { display: flex; gap: 6px; }
+.resolve-row input { flex: 1; }
+.facts { font-size: 12px; color: var(--muted); display: grid; gap: 3px; }
+.facts b { color: var(--ink); font-weight: 500; }
+.agent { border-radius: 12px; padding: 12px; display: grid; gap: 8px; position: relative; background: var(--panel);
+  border: 1px solid color-mix(in srgb, var(--ai1) 30%, var(--line)); }
+.agent-h { display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 13px; }
+.agent-h .i { fill: url(#aig); stroke: none; }
+.agent p { margin: 0; font-size: 12px; color: var(--muted); }
+.agent .btns { display: flex; gap: 6px; flex-wrap: wrap; }
+.agent .btns button { font-size: 12px; padding: 5px 9px; }
+.agent button.ai-btn { background: linear-gradient(135deg, var(--ai1), var(--ai2)); color: #fff; border: 0; font-weight: 600; }
+.agent code { display: block; overflow-x: auto; white-space: nowrap; padding: 5px 7px; }
+@media (max-width: 820px) {
+  #modal { margin: 0; width: 100%; height: 100%; }
+  .m-wrap { width: 100vw; height: 100dvh; border-radius: 0; border: 0; display: block; overflow-y: auto; overscroll-behavior: contain; }
+  .m-head { padding-top: max(10px, env(safe-area-inset-top)); position: sticky; top: 0; z-index: 2; background: var(--panel); }
+  .m-titlebar { padding: 12px 16px 8px 10px; }
+  .m-body { display: flex; flex-direction: column; }
+  .agent p { display: none; }
+  .m-main { overflow: visible; padding: 16px 16px 28px; order: 2; }
+  .m-side { overflow: visible; border-left: 0; border-bottom: 1px solid var(--line-2); order: 1; grid-template-columns: 1fr 1fr; padding: 14px 16px; }
+  .m-side .full { grid-column: 1 / -1; }
+  textarea.m-title { font-size: 19px; }
+}
+
+/* ---------- lightbox */
+#lightbox::backdrop { background: rgba(8, 8, 10, .9); backdrop-filter: none; }
+#lightbox { width: 100vw; height: 100dvh; margin: 0; }
+.lb { width: 100%; height: 100%; display: grid; grid-template-rows: auto minmax(0,1fr); color: #fff; }
+.lb-bar { display: flex; align-items: center; gap: 10px; padding: max(10px, env(safe-area-inset-top)) 14px 10px; font-size: 13px; }
+.lb-bar .icon-btn, .lb-nav { color: #fff; }
+.lb-bar .icon-btn:hover { background: rgba(255,255,255,.12); }
+.lb-stage { position: relative; display: grid; place-items: center; padding: 0 56px 24px; min-height: 0; }
+.lb-stage img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 6px; box-shadow: 0 10px 40px rgba(0,0,0,.5); background: #fff; }
+.lb-nav { position: absolute; top: 50%; transform: translateY(-50%); width: 42px; height: 42px; border-radius: 50%; background: rgba(255,255,255,.1); border: 0; display: grid; place-items: center; }
+.lb-nav:hover { background: rgba(255,255,255,.2); }
+.lb-nav.prev { left: 8px; } .lb-nav.next { right: 8px; }
+@media (max-width: 720px) { .lb-stage { padding: 0 8px 16px; } .lb-nav { top: auto; bottom: 20px; transform: none; } }
+
+/* ---------- toast */
+#toasts { position: fixed; bottom: max(16px, env(safe-area-inset-bottom)); left: 50%; transform: translateX(-50%); display: grid; gap: 8px; z-index: 50; justify-items: center; pointer-events: none; }
+.toast { background: var(--ink); color: var(--panel); padding: 8px 14px; border-radius: 10px; font-size: 13px; box-shadow: var(--shadow-2); animation: pop .16s ease-out; }
+.toast.err { background: var(--issue); color: #fff; }
+[hidden] { display: none !important; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 </style>
 </head>
 <body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <linearGradient id="aig" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6f5cff"/><stop offset="1" stop-color="#1fa6e8"/></linearGradient>
+</defs></svg>
+
 <header><div class="bar">
   <h1>Tiantasks <span class="dot" id="dot" title="Live"></span></h1>
-  <label class="f">Project <select id="fProject"></select></label>
-  <label class="f">Assigned to <select id="fWho"></select></label>
-  <span class="spacer"></span>
+  <nav class="views" role="tablist" aria-label="View" id="views"></nav>
+  <label class="search"><span class="sr">Search</span><span id="searchIcon"></span>
+    <input id="search" type="search" placeholder="Search tickets" autocomplete="off"><kbd>/</kbd></label>
+  <label class="f"><span>Project</span> <select id="fProject" aria-label="Project"></select></label>
+  <label class="f"><span>Assigned to</span> <select id="fWho" aria-label="Assigned to"></select></label>
+  <span class="grow"></span>
   <span class="stats" id="stats"></span>
   <span class="stats" id="acct"></span>
-  <button class="icon" id="themeBtn" title="Theme" aria-label="Theme"></button>
-  <button class="primary" id="newBtn" title="Add a task or issue (N)">+ Add</button>
+  <button class="icon-btn" id="themeBtn" aria-label="Theme"></button>
 </div></header>
 
-<main>
-  <section class="card" id="qIssue"></section>
-  <section class="card" id="qTask"></section>
-
-  <aside class="card">
-    <h2>Activity</h2>
-    <div id="events"></div>
-    <div class="hint">Changes from Claude Code show up here live. Assign items to a Claude
-      (<b>claude</b>, or <b>claude-name</b> on a shared board), then in that repo ask it to
-      “work through your Tiantasks queue”.</div>
-  </aside>
-</main>
-
-<dialog id="newDlg" aria-labelledby="newTitle">
-  <form id="add" autocomplete="off" novalidate>
-    <div class="dlg-head">
-      <h2 id="newTitle">New task</h2>
-      <div class="seg" role="group" aria-label="Kind">
-        <button type="button" data-kind="task" class="on">Task</button>
-        <button type="button" data-kind="issue">Issue</button>
-      </div>
+<div class="wrap">
+  <form class="add card" id="add" autocomplete="off">
+    <div class="seg" role="group" aria-label="Kind">
+      <button type="button" data-kind="task" class="on">Task</button>
+      <button type="button" data-kind="issue">Issue</button>
     </div>
-    <label class="fld">Title <input name="title" maxlength="300" placeholder="What needs doing?"></label>
-    <label class="fld">Description <textarea name="body" rows="5" placeholder="Details, steps to reproduce, links…"></textarea></label>
-    <div class="fld">Screenshots
-      <div class="drop" id="drop">
-        <div class="thumbs" id="shots"></div>
-        <p>Paste with ⌘V, drag images here, or <button type="button" class="link" id="pick">choose files</button></p>
-      </div>
-    </div>
-    <div class="row4">
-      <label class="fld">Priority
-        <select name="priority"><option value="">None</option><option value="crit">crit</option>
-          <option value="high">high</option><option value="med">med</option><option value="low">low</option></select></label>
-      <label class="fld">Assignee <select name="assignee"></select></label>
-      <label class="fld">Tags <input name="tags" placeholder="ui, auth"></label>
-      <label class="fld">Project <input name="project" list="projList"></label>
-    </div>
+    <input name="title" placeholder="Add a task… (press Enter)" aria-label="Title" required>
+    <select name="priority" aria-label="Priority">
+      <option value="">No priority</option><option value="crit">crit</option><option value="high">high</option>
+      <option value="med">med</option><option value="low">low</option>
+    </select>
+    <select name="assignee" aria-label="Assignee"></select>
+    <input name="tags" placeholder="tags" aria-label="Tags">
+    <input name="project" placeholder="project" aria-label="Project" list="projList" required>
     <datalist id="projList"></datalist>
-    <p class="err" id="addErr" role="alert"></p>
-    <div class="dlg-foot">
-      <span class="kbd">⌘↵ to add · Esc to cancel</span>
-      <button type="button" id="cancel">Cancel</button>
-      <button type="submit" class="primary" id="submit">Add task</button>
-    </div>
+    <button class="primary">Add</button>
   </form>
-</dialog>
-<dialog id="lightbox" aria-label="Screenshot"><img alt=""></dialog>
-<input type="file" id="filePick" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
+
+  <section id="vQueues" hidden>
+    <div class="qtabs" role="tablist" aria-label="Filter" id="qtabs"></div>
+    <div class="qgrid">
+      <section class="card" id="qIssue"></section>
+      <section class="card" id="qTask"></section>
+      <aside class="card">
+        <h2>Activity</h2>
+        <div id="events"></div>
+        <div class="hint">Changes from Claude Code show up here live. Assign items to a Claude
+          (<b>claude</b>, or <b>claude-name</b> on a shared board), then in that repo ask it to
+          “work through your Tiantasks queue”.</div>
+      </aside>
+    </div>
+  </section>
+
+  <section id="vBoard" hidden>
+    <div class="btool">
+      <div class="chips" id="kindChips" role="group" aria-label="Type"></div>
+      <span class="grow"></span>
+      <span class="stats" id="boardHint"></span>
+    </div>
+    <div class="board" id="board"></div>
+  </section>
+</div>
+
+<dialog id="modal" aria-label="Ticket"><div class="m-wrap" id="mwrap"></div></dialog>
+<dialog id="lightbox" aria-label="Screenshot"></dialog>
+<input type="file" id="filePick" multiple hidden>
+<div id="toasts" aria-live="polite"></div>
 
 <script>
 const $ = (s, el = document) => el.querySelector(s);
+const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const PR = {crit: 0, high: 1, med: 2, low: 3};
+const MAX_FILE = 1500000;
+const STATUS = {open: 'Not started', doing: 'In progress', done: 'Complete'};
 const saved = {
   get(k, d) { try { return localStorage.getItem('tt.' + k) ?? d; } catch { return d; } },
   set(k, v) { try { localStorage.setItem('tt.' + k, v); } catch {} },
 };
 
-let S = null, lastText = '', kind = 'task';
-let project = saved.get('project', ''), who = saved.get('who', '');
-const expanded = new Set();
+// ---------------------------------------------------------------- icons
+const ICON = {
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  x: '<path d="M18 6 6 18M6 6l12 12"/>',
+  check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
+  chat: '<path d="M21 12a8.5 8.5 0 0 1-12.4 7.6L3.5 21l1.4-4.9A8.5 8.5 0 1 1 21 12z"/>',
+  clip: '<path d="m21.4 11.1-9.2 9.2a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5"/>',
+  link: '<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/>',
+  copy: '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
+  trash: '<path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/>',
+  spark: '<path d="M11 2.5l1.9 5.6 5.6 1.9-5.6 1.9L11 17.5l-1.9-5.6L3.5 10l5.6-1.9z"/><path d="M18.5 14l.9 2.6 2.6.9-2.6.9-.9 2.6-.9-2.6-2.6-.9 2.6-.9z"/>',
+  board: '<rect x="3" y="4" width="5" height="16" rx="1.5"/><rect x="10" y="4" width="5" height="11" rx="1.5"/><rect x="17" y="4" width="4" height="7" rx="1.5"/>',
+  list: '<path d="M9 6h12M9 12h12M9 18h12M4 6h.01M4 12h.01M4 18h.01"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
+  image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/>',
+  left: '<path d="m15 18-6-6 6-6"/>', right: '<path d="m9 18 6-6-6-6"/>',
+  download: '<path d="M12 3v12m0 0-4-4m4 4 4-4M4 21h16"/>',
+  file: '<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/>',
+  up: '<path d="M12 19V5m0 0-6 6m6-6 6 6"/>',
+};
+const ic = (n, cls = '') => `<svg class="i ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON[n]}</svg>`;
+const sparkIc = () => `<svg class="i" viewBox="0 0 24 24" aria-hidden="true">${ICON.spark}</svg>`;
 
-async function api(method, path, body, quiet) {
+function statusIcon(s) {
+  const body = s === 'done'
+    ? '<circle cx="8" cy="8" r="7" fill="currentColor"/><path d="m4.9 8.2 2.1 2.1 4.1-4.3" fill="none" stroke="var(--panel)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>'
+    : s === 'doing'
+    ? '<circle cx="8" cy="8" r="6.2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M8 4.2a3.8 3.8 0 0 1 0 7.6z" fill="currentColor"/>'
+    : '<circle cx="8" cy="8" r="6.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-dasharray="3.2 2"/>';
+  return `<svg class="si si-${s}" viewBox="0 0 16 16" aria-label="${STATUS[s]}" role="img">${body}</svg>`;
+}
+function prioIcon(p) {
+  if (!p) return '';
+  if (p === 'crit') return `<svg class="pi pi-crit" viewBox="0 0 16 16" role="img" aria-label="Priority crit"><title>crit</title><rect x="1" y="1" width="14" height="14" rx="3.5" fill="currentColor"/><path d="M8 4.3v4.6M8 11.4v.3" stroke="#fff" stroke-width="2" stroke-linecap="round"/></svg>`;
+  const lvl = {high: 3, med: 2, low: 1}[p];
+  const bar = (x, h, n) => `<rect x="${x}" y="${14 - h}" width="3" height="${h}" rx="1" fill="currentColor" opacity="${n <= lvl ? 1 : .22}"/>`;
+  return `<svg class="pi pi-${p}" viewBox="0 0 16 16" role="img" aria-label="Priority ${p}"><title>${p}</title>${bar(1.5, 5, 1)}${bar(6.5, 8.5, 2)}${bar(11.5, 12, 3)}</svg>`;
+}
+const isAgent = n => !!n && (n === 'claude' || /^claude-/.test(n) || !!(S && S.people && !S.people.includes(n)));
+function hue(s) { let h = 0; for (const c of s) h = (h * 31 + c.charCodeAt(0)) % 360; return h; }
+function avatar(name, lg) {
+  const cls = 'av' + (lg ? ' lg' : '');
+  if (!name) return `<span class="${cls} none" title="Unassigned"></span>`;
+  if (isAgent(name)) return `<span class="${cls} ai" title="${esc(name)}">${sparkIc()}</span>`;
+  const ini = name.split(/[\s._-]+/).map(w => w[0]).join('').slice(0, 2).toUpperCase();
+  return `<span class="${cls}" style="background:hsl(${hue(name)} 45% 46%)" title="${esc(name)}">${esc(ini)}</span>`;
+}
+function ago(iso) {
+  if (!iso) return '';
+  const s = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (s < 60) return 'just now';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  if (s < 86400 * 7) return Math.floor(s / 86400) + 'd ago';
+  return new Date(iso).toLocaleDateString(undefined, {month: 'short', day: 'numeric'});
+}
+const fullDate = iso => iso ? new Date(iso).toLocaleString(undefined, {month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'}) : '';
+const size = n => n < 1024 ? n + ' B' : n < 1048576 ? Math.round(n / 1024) + ' KB' : (n / 1048576).toFixed(1) + ' MB';
+
+// Small, safe Markdown: code, bold, italics, links, lists, quotes, headings, and T-3 / I-12 cross-links.
+function md(src) {
+  src = String(src || '');
+  if (!src.trim()) return '';
+  const blocks = [];
+  src = src.replace(/```[^\n]*\n([\s\S]*?)```/g, (_, code) => {
+    blocks.push(`<pre><code>${esc(code.replace(/\n$/, ''))}</code></pre>`);
+    return `\u0000${blocks.length - 1}\u0000`;
+  });
+  const inline = s => esc(s)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[\s(])[*_]([^*_\s][^*_]*?)[*_](?=[\s).,!?:;]|$)/g, '$1<em>$2</em>')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
+    .replace(/(^|[\s(])(https?:\/\/[^\s<]+[^\s<.,)])/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>')
+    .replace(/(^|[^\w\/-])([TI]-\d+)\b/g, '$1<a href="#" class="xref" data-ref="$2">$2</a>');
+  const out = [];
+  let para = [], list = null;
+  const flushP = () => { if (para.length) out.push(`<p>${para.map(inline).join('<br>')}</p>`); para = []; };
+  const flushL = () => { if (list) out.push(`<${list.t}>${list.items.map(x => `<li>${x}</li>`).join('')}</${list.t}>`); list = null; };
+  for (const line of src.split('\n')) {
+    let m;
+    if ((m = line.match(/^\u0000(\d+)\u0000\s*$/))) { flushP(); flushL(); out.push(blocks[m[1]]); }
+    else if (!line.trim()) { flushP(); flushL(); }
+    else if ((m = line.match(/^#{1,4}\s+(.*)/))) { flushP(); flushL(); out.push(`<h4>${inline(m[1])}</h4>`); }
+    else if ((m = line.match(/^>\s?(.*)/))) { flushP(); flushL(); out.push(`<blockquote>${inline(m[1])}</blockquote>`); }
+    else if ((m = line.match(/^\s*(?:([-*+])|(\d+)[.)])\s+(.*)/))) {
+      flushP();
+      const t = m[1] ? 'ul' : 'ol';
+      if (!list || list.t !== t) { flushL(); list = {t, items: []}; }
+      list.items.push(inline(m[3]).replace(/^\[( |x|X)\]\s*/, (_, c) => c === ' ' ? '☐ ' : '☑ '));
+    }
+    else { flushL(); para.push(line); }
+  }
+  flushP(); flushL();
+  return out.join('').replace(/\u0000(\d+)\u0000/g, (_, i) => blocks[i]);
+}
+
+// ---------------------------------------------------------------- state
+let S = null, lastText = '', kind = 'task', lastVersion = null, pageBuild = null;
+let view = saved.get('view', 'queues'), qtab = saved.get('qtab', 'active'), kindF = saved.get('kind', 'all');
+let project = saved.get('project', ''), who = saved.get('who', ''), query = '';
+let dragId = null, addCol = null, doneLimit = 40;
+let M = null;            // open ticket: {ref, item, events, files, editDesc, draft, uploading}
+let modalPushed = false;
+{ const v = location.hash.replace(/^#\/?/, '').split('/')[0]; if (v === 'board' || v === 'queues') view = v; }
+
+function toast(msg, cls = '') {
+  const t = document.createElement('div');
+  t.className = 'toast ' + cls; t.textContent = msg;
+  $('#toasts').append(t);
+  setTimeout(() => t.remove(), cls === 'err' ? 5000 : 2200);
+}
+
+async function api(method, path, body) {
   const r = await fetch(path, {method, headers: {'Content-Type': 'application/json', 'X-Tiantasks': '1'},
     body: body ? JSON.stringify(body) : undefined});
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) {
-    const msg = data.error || ('Error ' + r.status);
-    if (!quiet) alert(msg);
-    throw new Error(msg);
-  }
+  if (!r.ok) { toast(data.error || ('Error ' + r.status), 'err'); throw new Error(data.error); }
   return data;
 }
+async function getJSON(path) {
+  const r = await fetch(path);
+  if (r.status === 401) { location.reload(); throw new Error('signed out'); }
+  if (!r.ok) throw Object.assign(new Error('HTTP ' + r.status), {status: r.status});
+  return r.json();
+}
+const patch = (ref, ch) => api('PATCH', `/api/items/${ref}`, ch);
 
 function typing() {
   const a = document.activeElement;
-  return a && a.closest && a.closest('.item') && (a.tagName === 'INPUT' || a.tagName === 'SELECT');
+  return !!(a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && a.closest('#modal, .col-add, .item'));
 }
-
-// ---- screenshots: shrink big images in the browser so each fits the database's ~2 MB limit
-const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
-const MAX_BYTES = 1900000;
-const EXT = {'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif'};
-const canvasBlob = (c, type, q) => new Promise(r => c.toBlob(r, type, q));
-
-async function prepareImage(file) {
-  let bmp;
-  try { bmp = await createImageBitmap(file); }
-  catch { throw new Error(`${file.name || 'That file'} isn't an image this browser can read.`); }
-  const longest = Math.max(bmp.width, bmp.height);
-  if (IMAGE_TYPES.includes(file.type) && longest <= 1920 && file.size <= 600000) return file;
-  const scale = Math.min(1, 1920 / longest);
-  const c = document.createElement('canvas');
-  c.width = Math.round(bmp.width * scale); c.height = Math.round(bmp.height * scale);
-  const g = c.getContext('2d');
-  g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height);
-  g.drawImage(bmp, 0, 0, c.width, c.height);
-  for (const q of [0.9, 0.8, 0.65, 0.5, 0.35]) {
-    let b = await canvasBlob(c, 'image/webp', q);
-    if (!b || b.type !== 'image/webp') b = await canvasBlob(c, 'image/jpeg', q);  // Safari can't encode WebP
-    if (b && b.size <= MAX_BYTES) return b;
-  }
-  throw new Error(`${file.name || 'That image'} is too large, even after shrinking it.`);
-}
-
-async function uploadImage(itemId, file) {
-  const blob = await prepareImage(file);
-  const base = (file.name || `screenshot-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}`).replace(/\.[^.]+$/, '');
-  const name = `${base}.${EXT[blob.type] || 'png'}`;
-  const r = await fetch(`/api/items/${itemId}/attachments?name=${encodeURIComponent(name)}`,
-    {method: 'POST', headers: {'Content-Type': blob.type, 'X-Tiantasks': '1'}, body: blob});
-  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `Upload failed (${r.status})`);
-}
-
-const imagesFrom = list => [...(list || [])].filter(f => f.type.startsWith('image/'));
 
 // Every write bumps a version number, so polling it is one tiny query. The full board is
 // only fetched when something changed, and nothing is polled while the tab is hidden.
-let lastVersion = null;
 async function tick() {
-  if (document.hidden || typing()) return;
+  if (document.hidden || typing() || dragId !== null) return;
   try {
     const r = await fetch('/api/version');
     if (r.status === 401) { location.reload(); return; }
-    const {v} = await r.json();
+    const {v, build} = await r.json();
     $('#dot').classList.remove('off');
-    if (v !== lastVersion) { lastVersion = v; await refresh(true); }
+    // A new release was deployed: reload onto it, but never out from under an open ticket or a drag.
+    if (build && pageBuild && build !== pageBuild && !M) { location.reload(); return; }
+    pageBuild = pageBuild || build;
+    if (v !== lastVersion) { lastVersion = v; await refresh(true); if (M) loadModal(); }
   } catch { $('#dot').classList.add('off'); }
 }
 
@@ -1807,338 +2254,718 @@ async function refresh(force) {
   } catch { $('#dot').classList.add('off'); }
 }
 
-function ago(iso) {
-  const s = (Date.now() - new Date(iso).getTime()) / 1000;
-  if (s < 60) return 'just now';
-  if (s < 3600) return Math.floor(s / 60) + 'm ago';
-  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
-  if (s < 86400 * 7) return Math.floor(s / 86400) + 'd ago';
-  return iso.slice(0, 10);
-}
-
 const byQueue = (a, b) => (a.status === 'doing' ? 0 : 1) - (b.status === 'doing' ? 0 : 1)
   || (PR[a.priority] ?? 9) - (PR[b.priority] ?? 9) || a.created_at.localeCompare(b.created_at);
+const byResolved = (a, b) => (b.resolved_at || '').localeCompare(a.resolved_at || '');
 
 function options(list, sel) {
   return list.map(([v, l]) => `<option value="${esc(v)}"${v === sel ? ' selected' : ''}>${esc(l)}</option>`).join('');
 }
 function assigneeOptions(sel) {
-  return options([['', 'Unassigned'], ...S.assignees.map(n => [n, n === S.me ? `${n} (you)` : n])], sel);
+  const names = [...S.assignees];
+  if (sel && !names.includes(sel)) names.push(sel);
+  return options([['', 'Unassigned'], ...names.map(n => [n, n === S.me ? `${n} (you)` : n])], sel);
+}
+const myAgent = () => S.shared ? `claude-${S.me}` : 'claude';
+
+function visible(items) {
+  let out = items;
+  if (who === '__none') out = out.filter(i => !i.assignee);
+  else if (who) out = out.filter(i => i.assignee === who);
+  const q = query.trim().toLowerCase();
+  if (q) out = out.filter(i => [i.ref, i.title, i.body, i.note, i.assignee, i.project, ...i.tags].join(' ').toLowerCase().includes(q));
+  return out;
 }
 
-function itemHTML(it) {
-  const done = it.status === 'done';
-  const meta = [];
-  if (it.status === 'doing') meta.push(`<span class="pill st">In progress</span>`);
-  if (it.priority) meta.push(`<span class="pill p-${it.priority}">${it.priority}</span>`);
-  if (!project) meta.push(`<span class="pill">${esc(it.project)}</span>`);
-  it.tags.forEach(t => meta.push(`<span class="pill">#${esc(t)}</span>`));
-  const shots = it.attachments || [];
-  if (shots.length) meta.push(`<span class="pill" title="${shots.length} screenshot${shots.length > 1 ? 's' : ''}">📎 ${shots.length}</span>`);
-  if (done) {
-    if (it.assignee) meta.push(`<span class="pill who">@${esc(it.assignee)}</span>`);
-    meta.push(`<span class="pill">resolved ${ago(it.resolved_at)}</span>`);
-  } else {
-    meta.push(`<select data-act="assign" aria-label="Assignee">${assigneeOptions(it.assignee)}</select>`);
-    meta.push(it.status === 'doing'
-      ? `<button class="link" data-act="pause">Pause</button>`
-      : `<button class="link" data-act="start">Start</button>`);
-  }
-  let detail = '';
-  if (expanded.has(it.id)) {
-    detail = `<div class="detail">
-      ${it.body ? `<div class="body">${esc(it.body)}</div>` : ''}
-      <div class="thumbs">${shots.map(a => `<figure class="thumb">
-        <img src="/api/attachments/${a.id}" alt="${esc(a.name)}" title="${esc(a.name)}" loading="lazy" data-act="zoom">
-        <button class="x" data-act="delShot" data-att="${a.id}" aria-label="Remove ${esc(a.name)}" title="Remove">×</button></figure>`).join('')}</div>
-      <div><button class="link" data-act="addShots">+ Add screenshots</button>
-        <span class="count">(or paste one while this item is open)</span></div>
-      <div class="comments"><h3>Comments</h3><div class="comments" id="cm-${it.id}"></div>
-        <div class="inline"><input data-f="comment" placeholder="Write a comment… (Enter to post)" aria-label="Comment">
-          <button data-act="comment">Comment</button></div></div>
-      ${done ? '' : `<div class="inline"><input data-f="note" placeholder="Resolution note (optional, Enter to resolve)" aria-label="Resolution note">
-        <button data-act="resolveNote">Resolve</button></div>`}
-      <div class="inline"><select data-act="priority" aria-label="Priority">${options([['', 'No priority'], ...Object.keys(PR).map(p => [p, p])], it.priority)}</select></div>
-      <h3>History</h3>
-      <div class="hist" id="hist-${it.id}">Loading history…</div>
-      <div><button class="link danger" data-act="delete">Delete ${it.ref}</button></div>
-    </div>`;
-    loadHistory(it.id);
-  }
-  return `<div class="item ${it.status}" data-id="${it.id}">
-    <div class="row">
-      <button class="check" data-act="toggle" title="${done ? 'Reopen' : 'Resolve'}" aria-label="${done ? 'Reopen' : 'Resolve'} ${it.ref}">${done ? '✓' : ''}</button>
-      <span class="ref">${it.ref}</span>
-      <span class="title" data-act="expand" title="Show details">${esc(it.title)}</span>
-    </div>
-    <div class="meta">${meta.join('')}</div>
-    ${done && it.note ? `<div class="note">${esc(it.note)}</div>` : ''}
-    ${detail}
-  </div>`;
-}
-
-const COMMENT_ACTIONS = ['commented', 'added a comment', 'replied', 'deleted a comment'];
-const openThreads = new Set();   // top-level comment ids whose replies are expanded
-const replyingTo = new Map();    // item id -> comment id being replied to
-let focusReply = false;
-
-function commentHTML(c, isReply) {
-  if (c.deleted) return `<div class="cmt deleted">${isReply ? 'Reply' : 'Comment'} deleted</div>`;
-  return `<div class="cmt" data-cid="${c.id}">
-    <div class="by"><b>${esc(c.author)}</b> · ${ago(c.at)}
-      <span class="cacts"><button class="link" data-act="reply" data-cid="${c.parent_id || c.id}">Reply</button>${
-        S.admin ? `<button class="link danger" data-act="delComment" data-cid="${c.id}">Delete</button>` : ''}</span></div>
-    <div class="txt">${esc(c.body)}</div></div>`;
-}
-
-function threadsHTML(itemId, comments) {
-  const kids = {};
-  comments.filter(c => c.parent_id).forEach(c => (kids[c.parent_id] ||= []).push(c));
-  const tops = comments.filter(c => !c.parent_id && !(c.deleted && !(kids[c.id] || []).length));
-  if (!tops.length) return '<div class="count">No comments yet.</div>';
-  return tops.map(c => {
-    const replies = kids[c.id] || [];
-    const open = openThreads.has(c.id);
-    const n = `${replies.length} ${replies.length === 1 ? 'reply' : 'replies'}`;
-    return `<div class="thread">${commentHTML(c)}
-      ${replies.length ? `<button class="fold" data-act="fold" data-cid="${c.id}" aria-expanded="${open}">
-        <span class="fline"></span>${open ? `Hide ${n}` : n} ${open ? '▾' : '▸'}</button>` : ''}
-      ${replies.length && open ? `<div class="replies">${replies.map(r => commentHTML(r, true)).join('')}</div>` : ''}
-      ${replyingTo.get(itemId) === c.id ? `<div class="inline replybox">
-        <input data-f="reply" data-parent="${c.id}" placeholder="Reply to ${esc(c.deleted ? 'thread' : c.author)}… (Enter to post)" aria-label="Reply">
-        <button data-act="sendReply" data-cid="${c.id}">Reply</button><button class="link" data-act="cancelReply">Cancel</button></div>` : ''}
-    </div>`;
-  }).join('');
-}
-
-async function loadHistory(id) {
-  const ref = S.items.find(i => i.id === id)?.ref || id;
-  const [evs, comments] = await Promise.all([
-    fetch(`/api/items/${id}/events`).then(r => r.json()),
-    fetch(`/api/items/${ref}/comments`).then(r => (r.ok ? r.json() : [])),
-  ]);
-  const el = document.getElementById('hist-' + id), cm = document.getElementById('cm-' + id);
-  if (cm) {
-    cm.innerHTML = threadsHTML(id, comments);
-    if (focusReply) { focusReply = false; const r = cm.querySelector('[data-f=reply]'); if (r) r.focus(); }
-  }
-  if (el) el.innerHTML = evs.filter(e => !COMMENT_ACTIONS.includes(e.action))
-    .map(e => `<div>${ago(e.at)} · <b>${esc(e.actor)}</b> ${esc(e.action)}${e.detail ? ': ' + esc(e.detail) : ''}</div>`).join('');
-}
-
-function queueHTML(title, color, items, emptyMsg) {
-  const active = items.filter(i => i.status !== 'done').sort(byQueue);
-  const done = items.filter(i => i.status === 'done').sort((a, b) => b.resolved_at.localeCompare(a.resolved_at));
-  const doing = active.filter(i => i.status === 'doing').length;
-  return `<div class="qh"><span class="sw" style="background:${color}"></span><h2>${title}</h2>
-      <span class="count">${active.length} open${doing ? ` · ${doing} in progress` : ''}</span></div>
-    ${active.length ? active.map(itemHTML).join('') : `<div class="empty">${emptyMsg}</div>`}
-    ${done.length ? `<details class="resolved" data-q="${title}"${saved.get('open.' + title) === '1' ? ' open' : ''}>
-      <summary>Resolved (${done.length})</summary>${done.slice(0, 100).map(itemHTML).join('')}</details>` : ''}`;
-}
-
+// ---------------------------------------------------------------- render
 function render() {
+  if (!S) return;
+  const active = S.items.filter(i => i.status !== 'done');
+  $('#views').innerHTML = [['queues', 'Queues', 'list'], ['board', 'Board', 'board']].map(([k, l, icn]) =>
+    `<button role="tab" data-view="${k}" class="${view === k ? 'on' : ''}" aria-selected="${view === k}">${ic(icn)}${l}${k === 'queues' ? `<span class="n">${active.length}</span>` : ''}</button>`).join('');
+  $('#vQueues').hidden = view !== 'queues';
+  $('#vBoard').hidden = view !== 'board';
+
   const projects = S.projects.map(p => [p.project, `${p.project} (${p.open})`]);
   $('#fProject').innerHTML = options([['', 'All projects'], ...projects], project);
   $('#fWho').innerHTML = options([['', 'Anyone'], ['__none', 'Unassigned'], ...S.assignees.map(n => [n, n === S.me ? `${n} (you)` : n])], who);
   $('#projList').innerHTML = S.projects.map(p => `<option value="${esc(p.project)}">`).join('');
+  const f = $('#add');
+  f.assignee.innerHTML = assigneeOptions(f.assignee.value);
+  if (!f.project.value) f.project.value = project || (S.projects[0] && S.projects[0].project) || 'general';
 
-  let items = S.items;
-  if (who === '__none') items = items.filter(i => !i.assignee);
-  else if (who) items = items.filter(i => i.assignee === who);
-  $('#qIssue').innerHTML = queueHTML('Issues', 'var(--issue)', items.filter(i => i.kind === 'issue'), 'No open issues.');
-  $('#qTask').innerHTML = queueHTML('Tasks', 'var(--task)', items.filter(i => i.kind === 'task'), 'No open tasks.');
-
-  const open = S.items.filter(i => i.status !== 'done');
-  const forClaude = open.filter(i => i.assignee === 'claude' || i.assignee.startsWith('claude-')).length;
-  $('#stats').textContent = `${open.length} open · ${forClaude} queued for Claude`;
+  const doing = active.filter(i => i.status === 'doing').length;
+  const agents = active.filter(i => isAgent(i.assignee)).length;
+  $('#stats').textContent = `${active.length} open · ${doing} in progress · ${agents} with agents`;
   $('#acct').innerHTML = S.shared ? `· ${esc(S.me)} · <a href="/logout">Sign out</a>` : '';
 
-  $('#events').innerHTML = S.events.length ? S.events.map(e => `<div class="ev">
-      <b class="${e.actor === 'claude' ? 'claude' : ''}">${esc(e.actor)}</b> ${esc(e.action)}
+  if (view === 'board') renderBoard(); else renderQueues();
+}
+
+// ---- queues
+function rowHTML(it) {
+  const done = it.status === 'done';
+  const meta = [];
+  if (it.status === 'doing') meta.push(`<span class="pill st">In progress</span>`);
+  if (it.priority) meta.push(prioIcon(it.priority));
+  if (!project) meta.push(`<span class="pill">${esc(it.project)}</span>`);
+  it.tags.slice(0, 3).forEach(t => meta.push(`<span class="pill">#${esc(t)}</span>`));
+  if (it.files) meta.push(`<span class="cnt" title="${it.files} file(s)">${ic('clip')}${it.files}</span>`);
+  if (it.comments) meta.push(`<span class="cnt" title="${it.comments} comment(s)">${ic('chat')}${it.comments}</span>`);
+  if (done) meta.push(`<span class="cnt">completed ${ago(it.resolved_at)}</span>`);
+  const quick = done ? '' : it.status === 'doing'
+    ? `<button class="link quick" data-act="pause">Pause</button>`
+    : `<button class="link quick" data-act="start">Start</button>`;
+  return `<div class="item ${it.status}" data-id="${it.id}" data-ref="${it.ref}" data-act="open" tabindex="0">
+    <button class="check" data-act="toggle" title="${done ? 'Reopen' : 'Complete'}" aria-label="${done ? 'Reopen' : 'Complete'} ${it.ref}">${done ? ic('check') : ''}</button>
+    <span class="ref">${it.ref}</span>
+    <span class="title">${esc(it.title)}</span>
+    <span class="row-end">${quick}${avatar(it.assignee)}</span>
+    ${meta.length ? `<span class="row-meta">${meta.join('')}</span>` : ''}
+    ${done && it.note ? `<div class="note">${esc(it.note)}</div>` : ''}
+  </div>`;
+}
+
+const QTABS = [['active', 'Active', i => i.status !== 'done'], ['doing', 'In progress', i => i.status === 'doing'],
+               ['done', 'Resolved', i => i.status === 'done'], ['all', 'All', () => true]];
+
+function queueHTML(title, color, items, emptyMsg) {
+  const doing = items.filter(i => i.status === 'doing').length;
+  const act = items.filter(i => i.status !== 'done').sort(byQueue);
+  const done = items.filter(i => i.status === 'done').sort(byResolved);
+  const list = [...act, ...done.slice(0, 200)];
+  const label = qtab === 'done' ? `${done.length} resolved` : `${act.length} open${doing ? ` · ${doing} in progress` : ''}`;
+  return `<div class="qh"><span class="sw" style="background:${color}"></span><h2>${title}</h2><span class="count">${label}</span></div>
+    ${list.length ? list.map(rowHTML).join('') : `<div class="empty">${emptyMsg}</div>`}`;
+}
+
+function renderQueues() {
+  const items = visible(S.items);
+  $('#qtabs').innerHTML = QTABS.map(([k, l, f]) =>
+    `<button class="tab ${qtab === k ? 'on' : ''}" role="tab" aria-selected="${qtab === k}" data-qtab="${k}">${l}<span class="n">${items.filter(f).length}</span></button>`).join('');
+  const f = QTABS.find(t => t[0] === qtab)[2];
+  const shown = items.filter(f);
+  const none = {active: 'Nothing open.', doing: 'Nothing in progress.', done: 'Nothing resolved yet.', all: 'Nothing here.'}[qtab];
+  $('#qIssue').innerHTML = queueHTML('Issues', 'var(--issue)', shown.filter(i => i.kind === 'issue'), none.replace('Nothing', 'No issues').replace('No issues here', 'No issues'));
+  $('#qTask').innerHTML = queueHTML('Tasks', 'var(--task)', shown.filter(i => i.kind === 'task'), none.replace('Nothing', 'No tasks').replace('No tasks here', 'No tasks'));
+  $('#events').innerHTML = S.events.length ? S.events.map(e => `<div class="ev" data-ref="${esc(e.ref)}">
+      <b class="${isAgent(e.actor) ? 'ai' : ''}">${esc(e.actor)}</b> ${esc(e.action)}
       <span class="ref">${esc(e.ref)}</span> ${esc(e.title)}${e.detail ? ` <span class="t">— ${esc(e.detail)}</span>` : ''}
       <div class="t">${ago(e.at)}${project ? '' : ' · ' + esc(e.project)}</div></div>`).join('')
     : '<div class="empty">No activity yet.</div>';
 }
 
-document.addEventListener('click', async e => {
-  const el = e.target.closest('[data-act]');
-  if (!el || el.tagName === 'SELECT') return;
-  const item = el.closest('.item'); const id = item && +item.dataset.id;
-  const it = id && S.items.find(i => i.id === id);
-  if (!it) return;
-  const act = el.dataset.act;
-  if (act === 'expand') { expanded.has(id) ? expanded.delete(id) : expanded.add(id); render(); return; }
-  if (act === 'fold') { const c = +el.dataset.cid; openThreads.has(c) ? openThreads.delete(c) : openThreads.add(c); return loadHistory(id); }
-  if (act === 'reply') { replyingTo.set(id, +el.dataset.cid); openThreads.add(+el.dataset.cid); focusReply = true; return loadHistory(id); }
-  if (act === 'cancelReply') { replyingTo.delete(id); return loadHistory(id); }
-  if (act === 'sendReply') {
-    const v = $('[data-f=reply]', item).value.trim(); if (!v) return;
-    await api('POST', `/api/items/${id}/comment`, {text: v, parent_id: +el.dataset.cid});
-    replyingTo.delete(id); openThreads.add(+el.dataset.cid);
+// ---- board
+function cardHTML(it) {
+  const live = it.status === 'doing' && isAgent(it.assignee);
+  const tags = it.tags.slice(0, 3).map(t => `<span class="tag">#${esc(t)}</span>`).join('');
+  const bits = [];
+  if (!project) bits.push(`<span class="tag">${esc(it.project)}</span>`);
+  if (it.comments) bits.push(`<span class="cnt">${ic('chat')}${it.comments}</span>`);
+  if (it.files) bits.push(`<span class="cnt">${ic('clip')}${it.files}</span>`);
+  const when = it.status === 'done' ? ago(it.resolved_at) : ago(it.updated_at);
+  return `<article class="kcard ${it.status}${live ? ' live' : ''}" draggable="true" data-id="${it.id}" data-ref="${it.ref}" data-act="open" tabindex="0" aria-label="${it.ref} ${esc(it.title)}">
+    ${it.cover ? `<img class="cover" src="/api/attachments/${it.cover}" alt="" loading="lazy" draggable="false">` : ''}
+    <div class="kc-top"><span class="kind-dot ${it.kind}" title="${it.kind}"></span><span class="ref">${it.ref}</span>${prioIcon(it.priority)}
+      ${live ? `<span class="working">${sparkIc()} working</span>` : ''}<span class="grow"></span>${avatar(it.assignee)}</div>
+    <div class="kc-title">${esc(it.title)}</div>
+    ${it.status === 'done' && it.note ? `<div class="kc-note">${esc(it.note)}</div>` : ''}
+    ${tags || bits.length || when ? `<div class="kc-meta">${tags}${bits.join('')}<span class="age">${when}</span></div>` : ''}
+  </article>`;
+}
+
+function renderBoard() {
+  $('#kindChips').innerHTML = [['all', 'All'], ['task', 'Tasks'], ['issue', 'Issues']].map(([k, l]) =>
+    `<button class="chip ${kindF === k ? 'on' : ''}" data-kind-f="${k}" aria-pressed="${kindF === k}">${l}</button>`).join('');
+  $('#boardHint').innerHTML = matchMedia('(hover: hover)').matches ? 'Drag cards between columns · <kbd>C</kbd> new · <kbd>/</kbd> search' : 'Swipe between columns';
+  let items = visible(S.items);
+  if (kindF !== 'all') items = items.filter(i => i.kind === kindF);
+  const empty = {open: 'Nothing waiting.', doing: 'Nothing in progress.', done: 'Nothing complete yet.'};
+  $('#board').innerHTML = Object.entries(STATUS).map(([st, label]) => {
+    const list = items.filter(i => i.status === st).sort(st === 'done' ? byResolved : byQueue);
+    const lim = st === 'done' ? doneLimit : Infinity;
+    const form = addCol === st ? `<form class="col-add" data-status="${st}">
+        <textarea name="title" rows="2" placeholder="Title for a new ${kindF === 'issue' ? 'issue' : 'task'}…" aria-label="Title"></textarea>
+        <div class="row"><button type="button" class="ghost" data-act="col-cancel">Cancel</button><button class="primary">Add</button></div></form>` : '';
+    return `<section class="col" data-status="${st}" aria-label="${label}">
+      <header class="col-h">${statusIcon(st)}<h2>${label}</h2><span class="count">${list.length}</span><span class="grow"></span>
+        <button class="icon-btn" data-act="col-add" data-status="${st}" title="Add to ${label}" aria-label="Add to ${label}">${ic('plus')}</button></header>
+      <div class="col-body" data-drop="${st}">${form}
+        ${list.slice(0, lim).map(cardHTML).join('') || (form ? '' : `<div class="col-empty">${empty[st]}</div>`)}
+        ${list.length > lim ? `<button class="more" data-act="more">Show ${Math.min(40, list.length - lim)} more</button>` : ''}
+      </div></section>`;
+  }).join('');
+  const ta = $('form.col-add textarea');
+  if (ta) ta.focus();
+}
+
+// ---------------------------------------------------------------- ticket modal
+async function openItem(ref) {
+  ref = ref.toUpperCase();
+  if (M && M.ref === ref) return;
+  M = {ref, item: S && S.items.find(i => i.ref === ref), events: null, files: null, comments: null, editDesc: false,
+       draft: '', uploading: 0, openThreads: new Set(), replyTo: null, replyDraft: ''};
+  const target = `#${view}/${ref}`;
+  if (location.hash !== target) { history.pushState(null, '', target); modalPushed = true; }
+  const d = $('#modal');
+  if (!d.open) d.showModal();
+  renderModal();
+  await loadModal();
+  if (M && !M.item) return;
+  const title = $('#modal textarea.m-title');
+  if (title) autosize(title);
+}
+
+async function loadModal() {
+  if (!M) return;
+  const ref = M.ref;
+  try {
+    const [item, events, files, comments] = await Promise.all([
+      getJSON(`/api/items/${ref}`), getJSON(`/api/items/${ref}/events`), getJSON(`/api/items/${ref}/attachments`),
+      getJSON(`/api/items/${ref}/comments`)]);
+    if (!M || M.ref !== ref) return;
+    Object.assign(M, {item, events, files, comments});
+    if (!typing() || document.activeElement.tagName === 'SELECT') renderModal();
+  } catch (e) {
+    if (e.status === 404) { toast(`${ref} no longer exists`, 'err'); closeModal(); }
   }
-  if (act === 'delComment') {
+}
+
+function closeModal() {
+  const d = $('#modal');
+  if (d.open) d.close();
+}
+
+function onModalClosed() {
+  M = null;
+  if (/\/[TI]-\d+$/i.test(location.hash)) {
+    if (modalPushed) history.back(); else history.replaceState(null, '', '#' + view);
+  }
+  modalPushed = false;
+}
+
+const PHRASE = {
+  opened: d => `created this${d ? ' ' + esc(d) : ''}`, started: () => `moved this to <b>In progress</b>`,
+  paused: () => `moved this back to <b>Not started</b>`, reopened: () => `reopened this`,
+  resolved: () => `marked this <b>Complete</b>`, assigned: d => `assigned this ${esc(d)}`,
+  reprioritized: d => `set priority to <b>${esc(d)}</b>`, renamed: d => `renamed this ${esc(d)}`,
+  edited: () => `edited the description`, tagged: d => `set tags to ${esc(d)}`, moved: d => `moved this ${esc(d)}`,
+  noted: () => `updated the resolution note`, attached: d => `attached ${esc(d.replace(/\s*\(#\d+\)$/, ''))}`,
+  detached: d => `removed ${esc(d.replace(/\s*\(#\d+\)$/, ''))}`, deleted: () => 'deleted this',
+};
+
+const COMMENT_ACTIONS = ['commented', 'added a comment', 'replied', 'deleted a comment'];
+
+function eventHTML(e, images) {
+  const f = e.action === 'attached' && images.get(+((e.detail.match(/\(#(\d+)\)$/) || [])[1]));
+  const quote = (e.action === 'resolved' || e.action === 'noted') && e.detail ? `<span class="quote">“${esc(e.detail)}”</span>` : '';
+  const bul = {started: statusIcon('doing'), paused: statusIcon('open'), reopened: statusIcon('open'), resolved: statusIcon('done')}[e.action]
+    || (e.action === 'attached' ? ic('clip') : '<i></i>');
+  return `<div class="tl-ev"><span class="bul">${bul}</span><span><b>${esc(e.actor)}</b> ${(PHRASE[e.action] || (d => esc(e.action) + (d ? ': ' + esc(d) : '')))(e.detail || '')}
+    <span class="when" title="${esc(fullDate(e.at))}">· ${ago(e.at)}</span>${quote}
+    ${f ? `<button class="tl-shot" data-act="zoom" data-file="${f.id}" aria-label="View ${esc(f.name)}"><img src="${f.url}" alt="${esc(f.name)}" loading="lazy"></button>` : ''}</span></div>`;
+}
+
+function commentHTML(c, reply) {
+  if (c.deleted) return `<div class="cmt deleted${reply ? ' reply' : ''}"><div class="bubble"><div class="md">${reply ? 'Reply' : 'Comment'} deleted</div></div></div>`;
+  return `<div class="cmt${isAgent(c.author) ? ' ai' : ''}${reply ? ' reply' : ''}">${avatar(c.author, !reply)}
+    <div class="bubble"><div class="who"><b>${esc(c.author)}</b><span class="when" title="${esc(fullDate(c.at))}">${ago(c.at)}</span>
+      <span class="cacts"><button class="link" data-act="reply" data-cid="${c.parent_id || c.id}">Reply</button>${
+        S.admin ? `<button class="link danger" data-act="del-comment" data-cid="${c.id}">Delete</button>` : ''}</span></div>
+    <div class="md">${md(c.body)}</div></div></div>`;
+}
+
+// A comment, then (if it has replies) a fold line that expands them, then the reply box if open.
+function threadHTML(c, replies) {
+  const open = M.openThreads.has(c.id);
+  const n = `${replies.length} ${replies.length === 1 ? 'reply' : 'replies'}`;
+  return `<div class="thread">${commentHTML(c)}
+    ${replies.length ? `<button class="fold" data-act="fold" data-cid="${c.id}" aria-expanded="${open}"><span class="fline"></span>${open ? 'Hide ' + n : n} ${open ? '▾' : '▸'}</button>` : ''}
+    ${replies.length && open ? `<div class="replies">${replies.map(r => commentHTML(r, true)).join('')}</div>` : ''}
+    ${M.replyTo === c.id ? `<div class="replybox composer"><div class="box"><textarea data-f="reply" aria-label="Reply" placeholder="Reply to ${esc(c.deleted ? 'this thread' : c.author)}…">${esc(M.replyDraft)}</textarea>
+      <div class="row"><span class="help">Markdown · <kbd>⌘</kbd><kbd>↵</kbd> to send · <kbd>Esc</kbd> to cancel</span><span class="grow"></span>
+        <button class="ghost" data-act="cancel-reply">Cancel</button><button class="primary" data-act="send-reply" data-cid="${c.id}">Reply</button></div></div></div>` : ''}
+  </div>`;
+}
+
+function timelineHTML() {
+  if (!M.events || !M.comments) return '<div class="tl-ev">Loading…</div>';
+  const images = new Map((M.files || []).filter(f => f.mime.startsWith('image/')).map(f => [f.id, f]));
+  const kids = {};
+  M.comments.filter(c => c.parent_id).forEach(c => (kids[c.parent_id] ||= []).push(c));
+  const threads = M.comments.filter(c => !c.parent_id && !(c.deleted && !(kids[c.id] || []).length))
+    .map(c => ({at: c.at, html: threadHTML(c, kids[c.id] || [])}));
+  const events = [...M.events].reverse().filter(e => !COMMENT_ACTIONS.includes(e.action))
+    .map(e => ({at: e.at, html: eventHTML(e, images)}));
+  return [...events, ...threads].sort((a, b) => a.at.localeCompare(b.at)).map(x => x.html).join('');
+}
+
+function filesHTML() {
+  if (!M.files) return '';
+  const del = f => `<button class="del" data-act="detach" data-file="${f.id}" title="Remove" aria-label="Remove ${esc(f.name)}">${ic('x')}</button>`;
+  const tiles = M.files.map(f => f.mime.startsWith('image/')
+    ? `<div class="tile"><button class="thumb" data-act="zoom" data-file="${f.id}" aria-label="View ${esc(f.name)}"><img src="${f.url}" alt="${esc(f.name)}" loading="lazy"><span class="cap">${esc(f.name)} · ${size(f.size)}</span></button>${del(f)}</div>`
+    : `<div class="tile"><a class="filechip" href="${f.url}" download="${esc(f.name)}">${ic('file')}<span>${esc(f.name)}</span><span class="count">${size(f.size)}</span></a>${del(f)}</div>`);
+  for (let i = 0; i < M.uploading; i++) tiles.push('<div class="uploading">Uploading…</div>');
+  if (!tiles.length) return `<button class="drop wide" data-act="pick">${ic('image')}<span>Paste a screenshot (<kbd>⌘V</kbd>), drop images here, or click to choose</span></button>`;
+  tiles.push(`<button class="drop" data-act="pick">${ic('plus')}<span>Add</span></button>`);
+  return `<div class="gallery">${tiles.join('')}</div>`;
+}
+
+function agentPrompt(it) {
+  return `Work on Tiantasks ${it.ref} in project "${it.project}": ${it.title}\n\n` +
+    `Read it first with \`tt show ${it.ref}\`` + (it.files ? ` and look at its screenshots (\`tt files ${it.ref} --save /tmp/tt-${it.ref}\`, then open the saved files)` : '') +
+    `. Mark it started with \`tt start ${it.ref}\`, post progress with \`tt comment ${it.ref} "..."\`, and when finished run \`tt resolve ${it.ref} -m "<what you changed>"\`.`;
+}
+
+function renderModal() {
+  const w = $('#mwrap');
+  if (!M) return;
+  const it = M.item;
+  if (!it) { w.innerHTML = `<div class="m-head"><span class="ref">${esc(M.ref)}</span><span class="grow"></span><button class="icon-btn" data-act="close" aria-label="Close">${ic('x')}</button></div><div style="padding:24px;color:var(--muted)">Loading…</div>`; return; }
+  const done = it.status === 'done';
+  const scroller = () => matchMedia('(max-width: 820px)').matches ? w : $('.m-main', w);
+  const scroll = scroller() ? scroller().scrollTop : 0;
+  const pr = [['', 'No priority'], ['crit', 'Critical'], ['high', 'High'], ['med', 'Medium'], ['low', 'Low']];
+  w.innerHTML = `
+  <div class="m-head">
+    <span class="kind-badge ${it.kind}">${it.kind}</span><span class="ref">${it.ref}</span><span class="crumb">in ${esc(it.project)}</span>
+    <span class="grow"></span>
+    <button class="icon-btn" data-act="copy-link" title="Copy link" aria-label="Copy link">${ic('link')}</button>
+    <button class="icon-btn" data-act="delete" title="Delete" aria-label="Delete ${it.ref}">${ic('trash')}</button>
+    <button class="icon-btn" data-act="close" title="Close (Esc)" aria-label="Close">${ic('x')}</button>
+  </div>
+  <div class="m-titlebar"><textarea class="m-title" rows="1" data-f="title" aria-label="Title">${esc(it.title)}</textarea></div>
+  <div class="m-body">
+    <div class="m-main">
+      <div class="sec" style="margin-top:6px">
+        ${M.editDesc ? `<div class="editor"><textarea data-f="body" aria-label="Description" placeholder="Describe it. Markdown works: **bold**, \`code\`, - lists, links, and T-3 / I-12 references.">${esc(it.body)}</textarea>
+            <div class="row"><button class="primary" data-act="save-desc">Save</button><button class="ghost" data-act="cancel-desc">Cancel</button><span class="help"><kbd>⌘</kbd><kbd>↵</kbd> save · <kbd>Esc</kbd> cancel</span></div></div>`
+          : `<div class="md${it.body ? '' : ' placeholder'}" data-act="edit-desc" tabindex="0" title="Click to edit">${md(it.body) || 'Add a description…'}</div>`}
+      </div>
+      <div class="sec"><div class="sec-h">${ic('image')} Screenshots &amp; files${M.files && M.files.length ? ` <span class="count">${M.files.length}</span>` : ''}</div>${filesHTML()}</div>
+      <div class="sec"><div class="sec-h">Activity</div>
+        <div class="tl">${timelineHTML()}</div>
+        <div class="composer">${avatar(S.me, true)}<div class="box">
+          <textarea data-f="comment" placeholder="Leave a comment… paste screenshots right in" aria-label="Comment">${esc(M.draft)}</textarea>
+          <div class="row"><button class="icon-btn" data-act="pick" title="Attach files" aria-label="Attach files">${ic('clip')}</button>
+            <span class="help">Markdown · <kbd>⌘</kbd><kbd>↵</kbd> to send</span><span class="grow"></span>
+            <button class="primary" data-act="comment">Comment</button></div></div></div>
+      </div>
+    </div>
+    <aside class="m-side">
+      <div class="prop full"><span class="lbl">Status</span>
+        <div class="stseg" role="group" aria-label="Status">${Object.entries(STATUS).map(([s, l]) =>
+          `<button data-act="status" data-status="${s}" class="${it.status === s ? 'on' : ''}" aria-pressed="${it.status === s}">${statusIcon(s)}${l}</button>`).join('')}</div>
+      </div>
+      ${done ? `<div class="prop full"><label for="mNote">Resolution note</label><textarea id="mNote" data-f="note" rows="2" placeholder="What was done">${esc(it.note)}</textarea></div>`
+        : `<div class="prop full"><label for="mResolve">Complete with a note</label><div class="resolve-row"><input id="mResolve" data-f="resolve" placeholder="What was done (optional)"><button data-act="resolve" title="Complete">${ic('check')}</button></div></div>`}
+      <div class="prop"><label for="mAssignee">Assignee</label><select id="mAssignee" data-f="assignee">${assigneeOptions(it.assignee)}</select></div>
+      <div class="prop"><label for="mPriority">Priority</label><select id="mPriority" data-f="priority">${options(pr, it.priority)}</select></div>
+      <div class="prop"><label for="mProject">Project</label><input id="mProject" data-f="project" list="projList" value="${esc(it.project)}"></div>
+      <div class="prop"><label for="mTags">Tags</label><input id="mTags" data-f="tags" value="${esc(it.tags.join(', '))}" placeholder="ui, auth"></div>
+      <div class="agent full">
+        <div class="agent-h">${sparkIc()} Agent handoff</div>
+        <p>${isAgent(it.assignee) ? `<b>${esc(it.assignee)}</b> has this. Its updates land here live.` : 'Give this to Claude Code. It reads the description, thread and screenshots.'}</p>
+        <div class="btns">${it.assignee === myAgent() ? '' : `<button class="ai-btn" data-act="to-agent">Assign to ${esc(myAgent())}</button>`}<button data-act="copy-prompt">${ic('copy')} Copy prompt</button></div>
+        <code>tt show ${it.ref}</code>
+      </div>
+      <div class="facts full">
+        <div>Opened by <b>${esc(it.created_by || 'unknown')}</b> · ${esc(fullDate(it.created_at))}</div>
+        <div>Updated ${ago(it.updated_at)}${done ? ` · completed ${ago(it.resolved_at)}` : ''}</div>
+      </div>
+    </aside>
+  </div>`;
+  if (scroller()) scroller().scrollTop = scroll;
+  autosize($('textarea.m-title', w));
+  if (M.editDesc) { const t = $('[data-f=body]', w); t.focus(); t.setSelectionRange(t.value.length, t.value.length); }
+}
+
+function autosize(t) { if (!t) return; t.style.height = 'auto'; t.style.height = t.scrollHeight + 'px'; }
+
+async function modalSave(ch, quiet) {
+  if (!M || !M.item) return;
+  M.item = await patch(M.item.ref, ch);
+  if (!quiet) toast('Saved');
+  await loadModal();
+  refresh(true);
+}
+
+// ---- files
+async function shrink(file) {
+  if (!/^image\/(png|jpeg|webp)$/.test(file.type)) return file;
+  let bmp;
+  try { bmp = await createImageBitmap(file); } catch { return file; }
+  const big = Math.max(bmp.width, bmp.height);
+  if (file.size <= 1200000 && big <= 2600) return file;
+  let scale = Math.min(1, 2400 / big);
+  for (let tries = 0; tries < 5; tries++) {
+    const c = document.createElement('canvas');
+    c.width = Math.round(bmp.width * scale); c.height = Math.round(bmp.height * scale);
+    c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+    const png = await new Promise(r => c.toBlob(r, 'image/png'));
+    if (png && png.size <= MAX_FILE) return png;
+    const jpg = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.86));
+    if (jpg && jpg.size <= MAX_FILE) return jpg;
+    scale *= 0.75;
+  }
+  return file;
+}
+const b64 = blob => new Promise((res, rej) => {
+  const r = new FileReader();
+  r.onload = () => res(String(r.result).split(',')[1] || '');
+  r.onerror = rej;
+  r.readAsDataURL(blob);
+});
+function fileName(f, blob) {
+  let n = f.name && f.name !== 'image.png' ? f.name : `screenshot-${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}.png`;
+  if (blob.type === 'image/jpeg' && !/\.jpe?g$/i.test(n)) n = n.replace(/\.[a-z0-9]+$/i, '') + '.jpg';
+  return n;
+}
+async function uploadFiles(files) {
+  if (!M || !M.item || !files.length) return;
+  const ref = M.item.ref;
+  M.uploading += files.length; renderModal();
+  let ok = 0;
+  for (const f of files) {
+    try {
+      const blob = await shrink(f);
+      if (blob.size > MAX_FILE) { toast(`${f.name} is ${size(blob.size)}; the limit is 1.5 MB`, 'err'); continue; }
+      await api('POST', `/api/items/${ref}/attachments`, {name: fileName(f, blob), mime: blob.type || 'application/octet-stream', data: await b64(blob)});
+      ok++;
+    } catch {} finally { if (M) M.uploading--; }
+  }
+  if (ok) toast(ok === 1 ? 'Attached' : `Attached ${ok} files`);
+  await loadModal();
+  if (M && !typing()) renderModal();
+  refresh(true);
+}
+
+// ---- lightbox
+let LB = null;
+function openLightbox(id) {
+  const imgs = (M.files || []).filter(f => f.mime.startsWith('image/'));
+  LB = {imgs, i: Math.max(0, imgs.findIndex(f => f.id === id))};
+  renderLightbox();
+  const d = $('#lightbox');
+  if (!d.open) d.showModal();
+}
+function renderLightbox() {
+  const f = LB.imgs[LB.i];
+  $('#lightbox').innerHTML = `<div class="lb">
+    <div class="lb-bar"><span>${esc(f.name)}</span><span style="opacity:.6">${size(f.size)} · ${esc(f.created_by)} · ${ago(f.created_at)}</span>
+      <span class="grow"></span>${LB.imgs.length > 1 ? `<span style="opacity:.6">${LB.i + 1} / ${LB.imgs.length}</span>` : ''}
+      <a class="icon-btn" href="${f.url}" download="${esc(f.name)}" title="Download" aria-label="Download">${ic('download')}</a>
+      <button class="icon-btn" data-lb="close" aria-label="Close">${ic('x')}</button></div>
+    <div class="lb-stage" data-lb="stage">
+      ${LB.imgs.length > 1 ? `<button class="lb-nav prev" data-lb="prev" aria-label="Previous">${ic('left')}</button><button class="lb-nav next" data-lb="next" aria-label="Next">${ic('right')}</button>` : ''}
+      <img src="${f.url}" alt="${esc(f.name)}"></div></div>`;
+}
+function lbStep(d) { if (!LB || LB.imgs.length < 2) return; LB.i = (LB.i + d + LB.imgs.length) % LB.imgs.length; renderLightbox(); }
+
+async function copyText(text, msg) {
+  try { await navigator.clipboard.writeText(text); }
+  catch {
+    const t = document.createElement('textarea');
+    t.value = text; t.style.position = 'fixed'; t.style.opacity = '0';
+    ($('#modal').open ? $('#modal') : document.body).append(t); t.select();
+    document.execCommand('copy'); t.remove();
+  }
+  toast(msg || 'Copied');
+}
+
+// ---------------------------------------------------------------- routing
+function setView(v) {
+  view = v; saved.set('view', v);
+  history.replaceState(null, '', '#' + v + (M ? '/' + M.ref : ''));
+  render();
+}
+function route() {
+  const [v, ref] = location.hash.replace(/^#\/?/, '').split('/');
+  if ((v === 'board' || v === 'queues') && v !== view) { view = v; saved.set('view', v); render(); }
+  if (ref && /^[TI]-\d+$/i.test(ref)) { if (!M || M.ref !== ref.toUpperCase()) { modalPushed = false; openItem(ref); } }
+  else if (M) { modalPushed = false; closeModal(); }
+}
+window.addEventListener('popstate', route);
+
+// ---------------------------------------------------------------- events
+document.addEventListener('click', async e => {
+  const x = e.target.closest('a.xref');
+  if (x) { e.preventDefault(); openItem(x.dataset.ref); return; }
+  const tab = e.target.closest('[data-view]');
+  if (tab) return setView(tab.dataset.view);
+  const qt = e.target.closest('[data-qtab]');
+  if (qt) { qtab = qt.dataset.qtab; saved.set('qtab', qtab); return render(); }
+  const kf = e.target.closest('[data-kind-f]');
+  if (kf) { kindF = kf.dataset.kindF; saved.set('kind', kindF); return render(); }
+  const ev = e.target.closest('.ev[data-ref]');
+  if (ev) { if (S.items.some(i => i.ref === ev.dataset.ref)) openItem(ev.dataset.ref); else toast(`${ev.dataset.ref} was deleted`); return; }
+
+  const el = e.target.closest('[data-act]');
+  if (!el) return;
+  const act = el.dataset.act;
+
+  // board chrome
+  if (act === 'col-add') { addCol = el.dataset.status; return renderBoard(); }
+  if (act === 'col-cancel') { addCol = null; return renderBoard(); }
+  if (act === 'more') { doneLimit += 40; return renderBoard(); }
+
+  // modal
+  if (el.closest('#modal')) return modalClick(el, act, e);
+
+  // queue rows and cards
+  const host = el.closest('[data-id]');
+  const it = host && S.items.find(i => i.id === +host.dataset.id);
+  if (!it) return;
+  if (act === 'open') return openItem(it.ref);
+  e.stopPropagation();
+  if (act === 'toggle') await patch(it.ref, {status: it.status === 'done' ? 'open' : 'done'});
+  if (act === 'start') await patch(it.ref, {status: 'doing', ...(it.assignee ? {} : {assignee: S.me})});
+  if (act === 'pause') await patch(it.ref, {status: 'open'});
+  refresh(true);
+});
+
+async function modalClick(el, act, e) {
+  const it = M && M.item;
+  if (act === 'close') return closeModal();
+  if (!it) return;
+  if (act === 'edit-desc') { if (e.target.closest('a')) return; M.editDesc = true; return renderModal(); }
+  if (act === 'cancel-desc') { M.editDesc = false; return renderModal(); }
+  if (act === 'save-desc') { const v = $('#modal [data-f=body]').value; M.editDesc = false; return modalSave({body: v}); }
+  if (act === 'status') {
+    const st = el.dataset.status;
+    if (st === it.status) return;
+    return modalSave({status: st, ...(st === 'doing' && !it.assignee ? {assignee: S.me} : {})}, true);
+  }
+  if (act === 'resolve') return modalSave({status: 'done', note: $('#modal [data-f=resolve]').value}, true);
+  if (act === 'comment') {
+    const t = $('#modal [data-f=comment]'); const v = t.value.trim();
+    if (!v) { t.focus(); return; }
+    await api('POST', `/api/items/${it.ref}/comment`, {text: v});
+    M.draft = ''; t.value = '';
+    await loadModal(); renderModal(); refresh(true); return;   // redraw even though the box still has focus
+  }
+  if (act === 'fold') {
+    const c = +el.dataset.cid;
+    M.openThreads.has(c) ? M.openThreads.delete(c) : M.openThreads.add(c);
+    return renderModal();
+  }
+  if (act === 'reply') {
+    M.replyTo = +el.dataset.cid; M.replyDraft = ''; M.openThreads.add(M.replyTo);
+    renderModal();
+    const t = $('#modal [data-f=reply]'); if (t) t.focus();
+    return;
+  }
+  if (act === 'cancel-reply') { M.replyTo = null; return renderModal(); }
+  if (act === 'send-reply') {
+    const t = $('#modal [data-f=reply]'); const v = t.value.trim();
+    if (!v) { t.focus(); return; }
+    await api('POST', `/api/items/${it.ref}/comment`, {text: v, parent_id: +el.dataset.cid});
+    M.openThreads.add(+el.dataset.cid); M.replyTo = null; M.replyDraft = '';
+    await loadModal(); renderModal(); refresh(true); return;
+  }
+  if (act === 'del-comment') {
     if (!confirm('Delete this comment for everyone? Replies to it stay.')) return;
     await api('DELETE', `/api/comments/${el.dataset.cid}`);
+    await loadModal(); renderModal(); refresh(true); return;
   }
-  if (act === 'zoom') { $('#lightbox img').src = el.src; $('#lightbox img').alt = el.alt; $('#lightbox').showModal(); return; }
-  if (act === 'addShots') { pickTarget = id; $('#filePick').click(); return; }
-  if (act === 'delShot') {
-    if (!confirm('Remove this screenshot?')) return;
-    await api('DELETE', `/api/attachments/${el.dataset.att}`);
+  if (act === 'pick') { $('#filePick').click(); return; }
+  if (act === 'zoom') return openLightbox(+el.dataset.file);
+  if (act === 'detach') {
+    const f = M.files.find(x => x.id === +el.dataset.file);
+    if (!f || !confirm(`Remove ${f.name}?`)) return;
+    await api('DELETE', `/api/attachments/${f.id}`);
+    await loadModal(); refresh(true); return;
   }
-  if (act === 'toggle') await api('PATCH', `/api/items/${id}`, {status: it.status === 'done' ? 'open' : 'done'});
-  if (act === 'start') await api('PATCH', `/api/items/${id}`, {status: 'doing', ...(it.assignee ? {} : {assignee: S.me})});
-  if (act === 'pause') await api('PATCH', `/api/items/${id}`, {status: 'open'});
-  if (act === 'resolveNote') await api('PATCH', `/api/items/${id}`, {status: 'done', note: $('[data-f=note]', item).value});
-  if (act === 'comment') { const v = $('[data-f=comment]', item).value.trim(); if (!v) return; await api('POST', `/api/items/${id}/comment`, {text: v}); }
-  if (act === 'delete') { if (!confirm(`Delete ${it.ref} “${it.title}”? This can't be undone.`)) return; expanded.delete(id); await api('DELETE', `/api/items/${id}`); }
+  if (act === 'copy-link') return copyText(`${location.origin}${location.pathname}#${view}/${it.ref}`, 'Link copied');
+  if (act === 'copy-prompt') return copyText(agentPrompt(it), 'Prompt copied — paste it into Claude Code');
+  if (act === 'to-agent') {   // copy first: Safari only allows clipboard writes inside the click itself
+    copyText(agentPrompt(it), `Assigned to ${myAgent()} · prompt copied`);
+    return modalSave({assignee: myAgent()}, true);
+  }
+  if (act === 'delete') {
+    if (!confirm(`Delete ${it.ref} “${it.title}”? This can't be undone.`)) return;
+    await api('DELETE', `/api/items/${it.ref}`);
+    closeModal(); toast(`Deleted ${it.ref}`); refresh(true);
+  }
+}
+
+document.addEventListener('keydown', e => {
+  const t = e.target;
+  // queue rows / cards open with Enter
+  if (e.key === 'Enter' && t.matches && t.matches('[data-act=open]')) { e.preventDefault(); return openItem(t.dataset.ref); }
+  if (t.closest && t.closest('#modal')) {
+    const f = t.dataset && t.dataset.f;
+    if (f === 'title' && e.key === 'Enter') { e.preventDefault(); t.blur(); return; }
+    if (f === 'title' && e.key === 'Escape') { e.preventDefault(); t.value = M.item.title; t.blur(); return; }
+    if (f === 'body' && e.key === 'Escape') { e.preventDefault(); M.editDesc = false; return renderModal(); }
+    if (f === 'body' && e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); return $('#modal [data-act=save-desc]').click(); }
+    if (f === 'comment' && e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); return $('#modal [data-act=comment]').click(); }
+    if (f === 'reply' && e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); return $('#modal [data-act=send-reply]').click(); }
+    if (f === 'resolve' && e.key === 'Enter') { e.preventDefault(); return $('#modal [data-act=resolve]').click(); }
+    if (t.matches('.md[data-act=edit-desc]') && e.key === 'Enter') { e.preventDefault(); M.editDesc = true; return renderModal(); }
+    return;
+  }
+  if (t.closest && t.closest('form.col-add') && e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); return t.form.requestSubmit(); }
+  if (t.closest && t.closest('form.col-add') && e.key === 'Escape') { addCol = null; return renderBoard(); }
+  if (t.id === 'search' && e.key === 'Escape') { t.value = ''; query = ''; t.blur(); return render(); }
+  if (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || e.metaKey || e.ctrlKey || e.altKey || $('#lightbox').open) return;
+  if (e.key === '/') { e.preventDefault(); $('#search').focus(); }
+  else if (e.key === 'c') { e.preventDefault(); $('#add').title.focus(); }
+  else if (e.key === 'b') setView('board');
+  else if (e.key === 'q') setView('queues');
+});
+
+$('#lightbox').addEventListener('keydown', e => {
+  if (e.key === 'ArrowLeft') lbStep(-1);
+  if (e.key === 'ArrowRight') lbStep(1);
+});
+$('#lightbox').addEventListener('click', e => {
+  const b = e.target.closest('[data-lb]');
+  if (!b) return;
+  const a = b.dataset.lb;
+  if (a === 'prev') lbStep(-1);
+  else if (a === 'next') lbStep(1);
+  else if (a === 'close' || (a === 'stage' && e.target === b)) $('#lightbox').close();
+});
+
+const modal = $('#modal');
+modal.addEventListener('close', onModalClosed);
+modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });   // backdrop
+modal.addEventListener('cancel', e => {                                             // Esc
+  if (M && M.editDesc) { e.preventDefault(); M.editDesc = false; renderModal(); }
+  else if (M && M.replyTo) { e.preventDefault(); M.replyTo = null; renderModal(); }
+});
+modal.addEventListener('input', e => {
+  const f = e.target.dataset.f;
+  if (f === 'title') autosize(e.target);
+  if (f === 'comment' && M) M.draft = e.target.value;
+  if (f === 'reply' && M) M.replyDraft = e.target.value;
+});
+modal.addEventListener('focusout', e => {
+  const t = e.target; const f = t.dataset && t.dataset.f;
+  if (!M || !M.item) return;
+  if (f === 'title' && t.value.trim() && t.value.trim() !== M.item.title) modalSave({title: t.value}, true);
+  if (f === 'title' && !t.value.trim()) t.value = M.item.title;
+});
+modal.addEventListener('change', e => {
+  const t = e.target; const f = t.dataset.f;
+  if (!M || !M.item) return;
+  if (f === 'assignee') modalSave({assignee: t.value}, true);
+  if (f === 'priority') modalSave({priority: t.value}, true);
+  if (f === 'project' && t.value.trim()) modalSave({project: t.value.trim()}, true);
+  if (f === 'tags') modalSave({tags: t.value}, true);
+  if (f === 'note') modalSave({note: t.value});
+});
+modal.addEventListener('paste', e => {
+  const files = [...(e.clipboardData?.files || [])];
+  if (!files.length) return;
+  e.preventDefault();
+  uploadFiles(files);
+});
+let dragDepth = 0;
+modal.addEventListener('dragenter', e => { if (e.dataTransfer?.types?.includes('Files')) { dragDepth++; $('#mwrap').classList.add('dropping'); } });
+modal.addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; $('#mwrap').classList.remove('dropping'); } });
+modal.addEventListener('dragover', e => { if (e.dataTransfer?.types?.includes('Files')) e.preventDefault(); });
+modal.addEventListener('drop', e => {
+  dragDepth = 0; $('#mwrap').classList.remove('dropping');
+  if (!e.dataTransfer?.files?.length) return;
+  e.preventDefault();
+  uploadFiles([...e.dataTransfer.files]);
+});
+$('#filePick').addEventListener('change', e => { uploadFiles([...e.target.files]); e.target.value = ''; });
+// A file dropped anywhere else would navigate the tab away to the file.
+window.addEventListener('dragover', e => { if (e.dataTransfer?.types?.includes('Files')) e.preventDefault(); });
+window.addEventListener('drop', e => { if (e.dataTransfer?.types?.includes('Files') && !e.target.closest('#modal')) { e.preventDefault(); toast('Open a ticket to attach files to it'); } });
+
+// ---- board drag and drop
+document.addEventListener('dragstart', e => {
+  const c = e.target.closest && e.target.closest('.kcard');
+  if (!c) return;
+  dragId = +c.dataset.id;
+  c.classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+  e.dataTransfer.setData('text/plain', c.dataset.ref);
+});
+document.addEventListener('dragend', () => {
+  dragId = null;
+  $$('.dragging, .col-body.over').forEach(x => x.classList.remove('dragging', 'over'));
+});
+document.addEventListener('dragover', e => {
+  const col = dragId !== null && e.target.closest && e.target.closest('[data-drop]');
+  if (!col) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  $$('.col-body.over').forEach(x => x !== col && x.classList.remove('over'));
+  col.classList.add('over');
+});
+document.addEventListener('drop', async e => {
+  const col = dragId !== null && e.target.closest && e.target.closest('[data-drop]');
+  if (!col) return;
+  e.preventDefault();
+  const it = S.items.find(i => i.id === dragId);
+  const st = col.dataset.drop;
+  dragId = null;
+  if (!it || it.status === st) return render();
+  const ch = {status: st, ...(st === 'doing' && !it.assignee ? {assignee: S.me} : {})};
+  Object.assign(it, ch, st === 'done' ? {resolved_at: new Date().toISOString()} : {});   // optimistic
+  render();
+  try { await patch(it.ref, ch); if (st === 'done') toast(`${it.ref} complete`); } finally { refresh(true); }
+});
+
+document.addEventListener('submit', async e => {
+  const f = e.target;
+  if (!f.matches('form.col-add')) return;
+  e.preventDefault();
+  const title = f.title.value.trim();
+  if (!title) return;
+  await api('POST', '/api/items', {kind: kindF === 'issue' ? 'issue' : 'task', title, status: f.dataset.status,
+    project: project || $('#add').project.value.trim() || 'general',
+    assignee: who && who !== '__none' ? who : (f.dataset.status === 'doing' ? S.me : '')});
+  f.title.value = '';
   refresh(true);
 });
 
 document.addEventListener('change', async e => {
   const el = e.target;
-  if (el.id === 'fProject') { project = el.value; saved.set('project', project); return refresh(true); }
+  if (el.id === 'fProject') { project = el.value; saved.set('project', project); if (project) $('#add').project.value = project; return refresh(true); }
   if (el.id === 'fWho') { who = el.value; saved.set('who', who); return render(); }
-  const item = el.closest('.item'); if (!item) return;
-  if (el.dataset.act === 'assign') await api('PATCH', `/api/items/${item.dataset.id}`, {assignee: el.value});
-  if (el.dataset.act === 'priority') await api('PATCH', `/api/items/${item.dataset.id}`, {priority: el.value});
-  refresh(true);
 });
+$('#search').addEventListener('input', e => { query = e.target.value; render(); });
 
-document.addEventListener('toggle', e => {
-  if (e.target.matches && e.target.matches('details.resolved')) saved.set('open.' + e.target.dataset.q, e.target.open ? '1' : '0');
-}, true);
+document.querySelectorAll('.seg button').forEach(b => b.addEventListener('click', () => {
+  kind = b.dataset.kind;
+  document.querySelectorAll('.seg button').forEach(x => x.classList.toggle('on', x === b));
+  $('#add').title.placeholder = `Add ${kind === 'task' ? 'a task' : 'an issue'}… (press Enter)`;
+  $('#add').title.focus();
+}));
 
-// ---- "+ Add" dialog
-const dlg = $('#newDlg'), form = $('#add');
-let pending = [];          // screenshots waiting to be uploaded with the new item
-let pickTarget = null;     // null = the dialog; otherwise the id of an open item
+// On phones the compose bar is one line until you start typing in it.
+$('#add').title.addEventListener('focus', () => $('#add').classList.add('expanded'));
+$('#add').title.addEventListener('blur', () => setTimeout(() => {
+  const f = $('#add');
+  if (!f.title.value.trim() && !f.contains(document.activeElement)) f.classList.remove('expanded');
+}, 250));
 
-function setKind(k) {
-  kind = k;
-  document.querySelectorAll('.seg button').forEach(x => x.classList.toggle('on', x.dataset.kind === k));
-  $('#newTitle').textContent = k === 'task' ? 'New task' : 'New issue';
-  $('#submit').textContent = k === 'task' ? 'Add task' : 'Add issue';
-  form.title.placeholder = k === 'task' ? 'What needs doing?' : "What's wrong?";
-}
-
-function renderPending() {
-  $('#shots').innerHTML = pending.map((p, i) => `<figure class="thumb"><img src="${p.url}" alt="${esc(p.file.name || 'screenshot')}">
-    <button type="button" class="x" data-rm="${i}" aria-label="Remove">×</button></figure>`).join('');
-}
-
-function addPending(files) {
-  for (const f of imagesFrom(files)) pending.push({file: f, url: URL.createObjectURL(f)});
-  renderPending();
-}
-
-function clearPending() {
-  pending.forEach(p => URL.revokeObjectURL(p.url));
-  pending = []; renderPending();
-}
-
-function openNew() {
-  if (!S || dlg.open) return;
-  form.reset(); clearPending(); setKind(kind);
-  $('#addErr').textContent = '';
-  form.assignee.innerHTML = assigneeOptions('');
-  form.project.value = project || (S.projects[0] && S.projects[0].project) || 'general';
-  $('#submit').disabled = false;
-  dlg.showModal();
-  form.title.focus();
-}
-
-$('#newBtn').addEventListener('click', openNew);
-$('#cancel').addEventListener('click', () => dlg.close());
-dlg.addEventListener('close', clearPending);
-document.querySelectorAll('.seg button').forEach(b => b.addEventListener('click', () => { setKind(b.dataset.kind); form.title.focus(); }));
-$('#shots').addEventListener('click', e => {
-  const b = e.target.closest('[data-rm]'); if (!b) return;
-  URL.revokeObjectURL(pending[+b.dataset.rm].url); pending.splice(+b.dataset.rm, 1); renderPending();
-});
-$('#pick').addEventListener('click', () => { pickTarget = null; $('#filePick').click(); });
-$('#lightbox').addEventListener('click', () => $('#lightbox').close());
-
-const drop = $('#drop');
-drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
-drop.addEventListener('dragleave', () => drop.classList.remove('over'));
-drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('over'); addPending(e.dataTransfer.files); });
-
-async function uploadToItem(id, files) {
-  try { for (const f of imagesFrom(files)) await uploadImage(id, f); }
-  catch (err) { alert(err.message); }
-  refresh(true);
-}
-
-$('#filePick').addEventListener('change', e => {
-  const files = [...e.target.files]; e.target.value = '';
-  if (pickTarget === null) addPending(files); else uploadToItem(pickTarget, files);
-});
-
-// Paste a screenshot into the dialog, or into whichever item's details are open.
-document.addEventListener('paste', e => {
-  const files = imagesFrom(e.clipboardData && e.clipboardData.files);
-  if (!files.length) return;
-  if (dlg.open) { e.preventDefault(); addPending(files); return; }
-  const open = [...expanded];
-  const focused = document.activeElement && document.activeElement.closest && document.activeElement.closest('.item');
-  const target = focused ? +focused.dataset.id : (open.length === 1 ? open[0] : null);
-  if (target) { e.preventDefault(); uploadToItem(target, files); }
-});
-
-document.addEventListener('keydown', e => {
-  if (dlg.open && e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); form.requestSubmit(); return; }
-  // Enter in an item's comment / resolution-note box does the same as its button.
-  const f = e.target && e.target.dataset && e.target.dataset.f;
-  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && (f === 'comment' || f === 'note' || f === 'reply')) {
-    e.preventDefault();
-    const sel = {comment: '[data-act=comment]', note: '[data-act=resolveNote]', reply: '[data-act=sendReply]'}[f];
-    const btn = (f === 'reply' ? e.target.closest('.replybox') : e.target.closest('.item')).querySelector(sel);
-    if (btn) btn.click();
-    return;
-  }
-  const t = e.target;
-  const inField = t && (t.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName));
-  if (!inField && !dlg.open && !e.metaKey && !e.ctrlKey && !e.altKey && e.key.toLowerCase() === 'n') { e.preventDefault(); openNew(); }
-});
-
-form.addEventListener('submit', async e => {
+$('#add').addEventListener('submit', async e => {
   e.preventDefault();
-  const btn = $('#submit');
-  if (btn.disabled) return;
-  const title = form.title.value.trim();
-  if (!title) { $('#addErr').textContent = 'Give it a title.'; form.title.focus(); return; }
-  btn.disabled = true; $('#addErr').textContent = '';
-  let created = null;
-  try {
-    btn.textContent = 'Adding…';
-    created = await api('POST', '/api/items', {kind, title, body: form.body.value, priority: form.priority.value,
-      assignee: form.assignee.value, tags: form.tags.value, project: form.project.value.trim()}, true);
-    for (let i = 0; i < pending.length; i++) {
-      btn.textContent = `Uploading ${i + 1} of ${pending.length}…`;
-      await uploadImage(created.id, pending[i].file);
-    }
-    dlg.close();
-  } catch (err) {
-    if (created) {  // the item exists; don't let a retry create a duplicate
-      dlg.close();
-      alert(`Added ${created.ref}, but a screenshot didn't upload: ${err.message} Open ${created.ref} to try again.`);
-    } else {
-      $('#addErr').textContent = err.message;
-    }
-  } finally {
-    btn.disabled = false; setKind(kind);
-    refresh(true);
-  }
+  const f = e.target;
+  await api('POST', '/api/items', {kind, title: f.title.value, priority: f.priority.value,
+    assignee: f.assignee.value, tags: f.tags.value, project: f.project.value.trim()});
+  f.title.value = ''; f.tags.value = ''; f.title.focus();
+  refresh(true);
 });
 
+$('#searchIcon').outerHTML = ic('search');
+setInterval(tick, 4000);
+setInterval(() => { if (S && !document.hidden && !typing() && dragId === null) { render(); if (M && !typing()) renderModal(); } }, 60000);  // keep "5m ago" fresh
+document.addEventListener('visibilitychange', tick);
 // ---- theme: Auto (follows the system) → Dark → Light
 const THEMES = [['auto', '◐', 'Theme: auto (follows your system)'], ['dark', '☾', 'Theme: dark'], ['light', '☀', 'Theme: light']];
 function showTheme() {
   const cur = document.documentElement.dataset.theme || 'auto';
-  const [, icon, label] = THEMES.find(t => t[0] === cur);
-  $('#themeBtn').textContent = icon; $('#themeBtn').title = label + ' · click to change';
+  const [, glyph, label] = THEMES.find(t => t[0] === cur);
+  $('#themeBtn').textContent = glyph; $('#themeBtn').title = label + ' · click to change';
 }
 $('#themeBtn').addEventListener('click', () => {
   const cur = document.documentElement.dataset.theme || 'auto';
@@ -2149,14 +2976,13 @@ $('#themeBtn').addEventListener('click', () => {
 });
 showTheme();
 
-setInterval(tick, 4000);
-setInterval(() => { if (S && !document.hidden && !typing()) render(); }, 60000);  // keep "5m ago" fresh
-document.addEventListener('visibilitychange', tick);
-tick();
+(async () => { await tick(); route(); })();
 </script>
 </body>
 </html>
 """
+
+PAGE_BUILD = hashlib.sha1(PAGE.encode()).hexdigest()[:12]  # open pages reload when this changes
 
 
 LOGIN_PAGE = r"""<!doctype html>

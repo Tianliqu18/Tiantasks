@@ -675,7 +675,7 @@ function App() {
         lines.push(
           <Text> </Text>,
           <Text>
-            <Text bold color={TH.accent}>Screenshots ({shots})</Text>
+            <Text bold color={TH.accent}>Screenshots & files ({shots})</Text>
             <Text color={TH.muted}>  ↑↓ select to preview · o open full size</Text>
           </Text>,
         );
@@ -692,7 +692,9 @@ function App() {
             <Text color={TH.muted} backgroundColor={bg}>  {size}{selected ? "  ⏎/o open full size" : ""}</Text>
           </Text>,
         );
-        if (selected) {
+        if (selected && !row.a.mime?.startsWith("image/")) {
+          lines.push(<Text color={TH.muted}>    (not an image · press o to open it)</Text>);
+        } else if (selected) {
           // The preview sits under the selected screenshot, sized to the space available.
           const pv = ensurePreview(row.a, Math.min(w - 4, 100), Math.max(6, Math.min(22, bodyH - 10)));
           if (pv.status === "loading") lines.push(<Text color={TH.muted}>    loading preview…</Text>);
