@@ -40,6 +40,26 @@ never claim the same item), then `tt resolve ID -m "…"`. The Claude Code skill
 
 Agents that talk HTTP instead of using `tt` can read the API guide at `/llms.txt` on the board.
 
+## People, agents and initiatives
+
+Every agent works for a person: the login it acts under. The **Team** tab shows each person's
+agents (working, waiting, idle), what they're doing, and the initiatives they run. Inside tmux,
+Claude Code sessions are named after their session automatically (`master-app-billing`), so
+nothing needs configuring.
+
+- **Progress:** `tt progress ID "Harness runs end to end" --link <preview>` posts a milestone. The
+  latest one shows on the card, and the ticket opens with a progress summary.
+- **Flags:** anyone can flag an item, initiative or agent ("skip the CSV export"). It shows
+  sent → delivered → acknowledged; the agent answers with `tt ack F-12 "what I'll do"`.
+- **Asks:** `tt ask "rerun or skip?" --on ID` lands in the person's *Needs you* list, and their
+  answer goes straight back to the agent.
+- **Directives:** `--directive "their exact words"` on any write records that a person asked for
+  it; an adapter can check the quote against the agent's conversation.
+- **Custom fields:** `tt edit ID --field preview=https://…` or `--initiative app/billing`.
+
+Delivering flags into chats, reporting agent status and posting automatic milestones is the job
+of a small adapter for your own setup; it only uses the HTTP API above (`/llms.txt`).
+
 ## Shared board (Cloudflare)
 
 ```bash

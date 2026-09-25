@@ -30,16 +30,20 @@ from contextlib import contextmanager
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlencode, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
-VERSION = "2.7.0"
+VERSION = "2.8.0"
 DEFAULT_DB = Path.home() / ".tiantasks" / "tiantasks.db"
 CONFIG = Path.home() / ".tiantasks" / "config.json"
 DEFAULT_PORT = int(os.environ.get("TIANTASKS_PORT", 7777))
 PRIORITIES = ("crit", "high", "med", "low")
 PRANK = {p: i for i, p in enumerate(PRIORITIES)}
 STATUSES = ("open", "doing", "done")
-AGENT_NAME = re.compile(r"[a-z0-9][a-z0-9_.-]{0,39}")
+AGENT_NAME = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
+INITIATIVE_SLUG = re.compile(r"[a-z0-9][a-z0-9_.-]{0,40}(/[a-z0-9][a-z0-9_.-]{0,60})?")
+AGENT_STATES = ("working", "idle", "waiting", "offline")
+FLAG_STATES = ("sent", "delivered", "acked", "failed", "escalated", "closed")
+FLAG_OPEN = ("sent", "delivered", "failed", "escalated")
 IMAGE_TYPES = ("image/png", "image/jpeg", "image/webp", "image/gif")
 MAX_ATTACHMENT = 1_900_000  # D1 rows top out at 2 MB; the page shrinks screenshots to fit
 
@@ -99,7 +103,96 @@ CREATE TABLE IF NOT EXISTS comments (
   legacy_event_id INTEGER UNIQUE
 );
 CREATE INDEX IF NOT EXISTS comments_ref ON comments (ref);
+-- Agents (chats, bots) and the person each one works for. Reported by the agents themselves or
+-- by an adapter that watches them; the principal always comes from the login that reported it.
+CREATE TABLE IF NOT EXISTS agents (
+  name        TEXT PRIMARY KEY,
+  principal   TEXT NOT NULL DEFAULT '',
+  kind        TEXT NOT NULL DEFAULT '',
+  host        TEXT NOT NULL DEFAULT '',
+  project     TEXT NOT NULL DEFAULT '',
+  initiative  TEXT NOT NULL DEFAULT '',
+  state       TEXT NOT NULL DEFAULT '',
+  doing       TEXT NOT NULL DEFAULT '',
+  first_seen  TEXT NOT NULL,
+  last_seen   TEXT NOT NULL,
+  state_since TEXT
+);
+-- Initiatives: bigger pieces of work, each owned by an agent that runs it.
+CREATE TABLE IF NOT EXISTS initiatives (
+  slug       TEXT PRIMARY KEY,
+  project    TEXT NOT NULL DEFAULT '',
+  title      TEXT NOT NULL,
+  summary    TEXT NOT NULL DEFAULT '',
+  status     TEXT NOT NULL DEFAULT 'active',
+  owner      TEXT NOT NULL DEFAULT '',
+  principal  TEXT NOT NULL DEFAULT '',
+  link       TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+-- Free-form fields on items (e.g. initiative, preview, pr), so integrations need no schema change.
+CREATE TABLE IF NOT EXISTS item_fields (
+  item_id INTEGER NOT NULL,
+  key     TEXT NOT NULL,
+  value   TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (item_id, key)
+);
+-- Checkpoints: short milestone updates on an item and/or an initiative.
+CREATE TABLE IF NOT EXISTS checkpoints (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  ref        TEXT NOT NULL DEFAULT '',
+  initiative TEXT NOT NULL DEFAULT '',
+  actor      TEXT NOT NULL,
+  principal  TEXT NOT NULL DEFAULT '',
+  text       TEXT NOT NULL,
+  link       TEXT NOT NULL DEFAULT '',
+  attachment INTEGER,
+  source     TEXT NOT NULL DEFAULT 'agent',
+  at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS checkpoints_ref ON checkpoints (ref);
+CREATE INDEX IF NOT EXISTS checkpoints_initiative ON checkpoints (initiative);
+-- Flags (a note that must reach whoever runs something) and asks (an agent needs a person),
+-- with delivery receipts: sent -> delivered -> acked.
+CREATE TABLE IF NOT EXISTS flags (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind           TEXT NOT NULL DEFAULT 'flag',
+  ref            TEXT NOT NULL DEFAULT '',
+  initiative     TEXT NOT NULL DEFAULT '',
+  to_name        TEXT NOT NULL,
+  from_actor     TEXT NOT NULL,
+  from_principal TEXT NOT NULL DEFAULT '',
+  text           TEXT NOT NULL,
+  urgent         INTEGER NOT NULL DEFAULT 0,
+  status         TEXT NOT NULL DEFAULT 'sent',
+  note           TEXT NOT NULL DEFAULT '',
+  created_at     TEXT NOT NULL,
+  delivered_at   TEXT,
+  acked_at       TEXT,
+  escalated_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS flags_to ON flags (to_name, status);
+-- "A person told me to": the quoted instruction an agent acted on, checked against its chat.
+CREATE TABLE IF NOT EXISTS directives (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  actor      TEXT NOT NULL,
+  principal  TEXT NOT NULL DEFAULT '',
+  ref        TEXT NOT NULL DEFAULT '',
+  what       TEXT NOT NULL DEFAULT '',
+  quote      TEXT NOT NULL,
+  verified   INTEGER,
+  checked_at TEXT,
+  at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS directives_ref ON directives (ref);
+-- Bumped by writes that don't add an event, so /api/version still moves.
+CREATE TABLE IF NOT EXISTS changes (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  n  INTEGER NOT NULL DEFAULT 0
+);
 """
+BUMP_SQL = "INSERT INTO changes (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = n + 1"
 # Comments used to be stored only as 'commented' events; copy them into the comments table once.
 LEGACY_COMMENTS_SQL = """
 INSERT OR IGNORE INTO comments (item_id, ref, author, body, created_at, legacy_event_id)
@@ -199,7 +292,16 @@ class Store:
             raise TTError(f"no item {ref}", 404)
         item = self._row(r)
         item["attachments"] = self._attachment_meta(item["id"]).get(item["id"], [])
+        item["fields"] = self._fields(item["id"]).get(item["id"], {})
         return item
+
+    def _fields(self, item_id=None):
+        rows = self.db.execute("SELECT item_id, key, value FROM item_fields" +
+                               (" WHERE item_id=?" if item_id else ""), (item_id,) if item_id else ())
+        out = {}
+        for r in rows:
+            out.setdefault(r["item_id"], {})[r["key"]] = r["value"]
+        return out
 
     def _attachment_meta(self, item_id=None):
         sql = "SELECT id, item_id, name, mime, size FROM attachments"
@@ -277,6 +379,9 @@ class Store:
 
     def update(self, ref, actor, **ch):
         if_status, if_assignee = ch.pop("if_status", None), ch.pop("if_assignee", None)
+        fields = ch.pop("fields", None)
+        if fields:
+            self.set_fields(ref, actor, fields)
         with self.tx():
             it = self.get(ref)
             # Optional guards so two agents can't claim the same item.
@@ -389,6 +494,7 @@ class Store:
             self.db.execute("DELETE FROM items WHERE id=?", (it["id"],))
             self.db.execute("DELETE FROM attachments WHERE item_id=?", (it["id"],))
             self.db.execute("DELETE FROM comments WHERE ref=?", (it["ref"],))
+            self.db.execute("DELETE FROM item_fields WHERE item_id=?", (it["id"],))
             self._log(it, actor, "deleted")
         return it
 
@@ -405,9 +511,10 @@ class Store:
         if grep:
             sql += " AND (title LIKE ? OR body LIKE ? OR note LIKE ?)"; args += [f"%{grep}%"] * 3
         items = [self._row(r) for r in self.db.execute(sql, args)]
-        meta = self._attachment_meta()
+        meta, fields = self._attachment_meta(), self._fields()
         for it in items:
             it["attachments"] = meta.get(it["id"], [])
+            it["fields"] = fields.get(it["id"], {})
         return sorted(items, key=sort_key)
 
     def events(self, limit=40, project=None, item_id=None, ref=None):
@@ -422,7 +529,269 @@ class Store:
         return [dict(r) for r in self.db.execute(sql, args)]
 
     def version(self):
-        return self.db.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()[0]
+        return self.db.execute("SELECT (SELECT COALESCE(MAX(id), 0) FROM events) + "
+                               "(SELECT COALESCE(MAX(n), 0) FROM changes)").fetchone()[0]
+
+    def _bump(self):
+        self.db.execute(BUMP_SQL)
+
+    # ---- fields
+    def set_fields(self, ref, actor, fields):
+        """Set item fields; an empty value removes one. Returns the item."""
+        with self.tx():
+            it = self.get(ref)
+            for key, value in fields.items():
+                key, value = str(key).strip().lower(), str(value or "").strip()
+                if not re.fullmatch(r"[a-z][a-z0-9_]{0,30}", key):
+                    raise TTError(f"field names use lowercase letters, numbers and _ (got {key!r})")
+                if value == it["fields"].get(key, ""):
+                    continue
+                if value:
+                    self.db.execute("INSERT INTO item_fields (item_id, key, value) VALUES (?,?,?) "
+                                    "ON CONFLICT (item_id, key) DO UPDATE SET value=excluded.value",
+                                    (it["id"], key, value[:500]))
+                    self._log(it, actor, "set field", f"{key}: {value[:200]}")
+                else:
+                    self.db.execute("DELETE FROM item_fields WHERE item_id=? AND key=?", (it["id"], key))
+                    self._log(it, actor, "cleared field", key)
+        return self.get(ref)
+
+    # ---- agents
+    def touch_agent(self, name, principal):
+        """Record that an agent just acted and return its name on this board. Two people's chats
+        can share a name (everyone has a 'concierge'); the second person's becomes name-<person>."""
+        row = self.db.execute("SELECT principal FROM agents WHERE name=?", (name,)).fetchone()
+        if row and row["principal"] and principal and row["principal"] != principal:
+            name = f"{name}-{principal}"[:64]
+            row = self.db.execute("SELECT principal FROM agents WHERE name=?", (name,)).fetchone()
+            if row and row["principal"] and row["principal"] != principal:
+                raise TTError(f"agent '{name}' works for {row['principal']}, not {principal}", 403)
+        t = now_iso()
+        self.db.execute("INSERT INTO agents (name, principal, first_seen, last_seen) VALUES (?,?,?,?) "
+                        "ON CONFLICT (name) DO UPDATE SET last_seen=excluded.last_seen, "
+                        "principal=CASE WHEN agents.principal = '' THEN excluded.principal ELSE agents.principal END",
+                        (name, principal or "", t, t))
+        return name
+
+    def report_agent(self, name, principal, info):
+        """An agent's own status report (or its adapter's): kind, host, project, initiative, state, doing."""
+        name = str(name).strip().lower()
+        if not AGENT_NAME.fullmatch(name):
+            raise TTError("agent names use lowercase letters, numbers, - _ .")
+        state = info.get("state")
+        if state is not None and state not in AGENT_STATES:
+            raise TTError(f"state must be one of {', '.join(AGENT_STATES)}")
+        with self.tx():
+            name = self.touch_agent(name, principal)
+            cur = dict(self.db.execute("SELECT * FROM agents WHERE name=?", (name,)).fetchone())
+            sets = {k: str(info[k])[:300] for k in ("kind", "host", "project", "initiative", "state", "doing")
+                    if k in info and info[k] is not None and str(info[k])[:300] != cur[k]}
+            if "state" in sets:
+                sets["state_since"] = now_iso()
+            if sets:
+                cols = ", ".join(f"{k}=?" for k in sets)
+                self.db.execute(f"UPDATE agents SET {cols} WHERE name=?", (*sets.values(), name))
+                self._bump()
+        return self.agent(name)
+
+    def agent(self, name):
+        r = self.db.execute("SELECT * FROM agents WHERE name=?", (name,)).fetchone()
+        if not r:
+            raise TTError(f"no agent {name}", 404)
+        return dict(r)
+
+    def agents(self):
+        return [dict(r) for r in self.db.execute("SELECT * FROM agents ORDER BY principal, name")]
+
+    def principal_of(self, name):
+        """Who an agent works for; a person is their own principal."""
+        r = self.db.execute("SELECT principal FROM agents WHERE name=?", (name,)).fetchone()
+        return (r["principal"] if r else "") or name
+
+    # ---- initiatives
+    def initiatives(self):
+        return [dict(r) for r in self.db.execute("SELECT * FROM initiatives ORDER BY project, slug")]
+
+    def initiative(self, slug):
+        r = self.db.execute("SELECT * FROM initiatives WHERE slug=?", (slug,)).fetchone()
+        if not r:
+            raise TTError(f"no initiative {slug}", 404)
+        return dict(r)
+
+    def put_initiative(self, slug, principal, info):
+        slug = str(slug).strip().lower()
+        if not INITIATIVE_SLUG.fullmatch(slug):
+            raise TTError("initiative ids look like project/name (lowercase letters, numbers, - _ .)")
+        if info.get("status") not in (None, "active", "paused", "done"):
+            raise TTError("status must be active, paused or done")
+        t = now_iso()
+        with self.tx():
+            cur = self.db.execute("SELECT * FROM initiatives WHERE slug=?", (slug,)).fetchone()
+            if not cur:
+                title = " ".join(str(info.get("title") or slug.split("/")[-1]).split())
+                self.db.execute(
+                    "INSERT INTO initiatives (slug, project, title, summary, status, owner, principal, link,"
+                    " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (slug, info.get("project") or slug.split("/")[0], title, info.get("summary") or "",
+                     info.get("status") or "active", info.get("owner") or "",
+                     info.get("principal") or principal or "", info.get("link") or "", t, t))
+                self._bump()
+            else:
+                sets = {k: str(info[k]) for k in ("project", "title", "summary", "status", "owner", "principal", "link")
+                        if k in info and info[k] is not None and str(info[k]) != cur[k]}
+                if sets:
+                    sets["updated_at"] = t
+                    cols = ", ".join(f"{k}=?" for k in sets)
+                    self.db.execute(f"UPDATE initiatives SET {cols} WHERE slug=?", (*sets.values(), slug))
+                    self._bump()
+        return self.initiative(slug)
+
+    # ---- checkpoints
+    def checkpoint(self, actor, principal, text, ref="", initiative="", link="", attachment=None, source="agent"):
+        text = " ".join(str(text or "").split())
+        if not text:
+            raise TTError("a checkpoint needs some text")
+        if source not in ("agent", "auto", "person"):
+            raise TTError("source must be agent, auto or person")
+        with self.tx():
+            it = self.get(ref) if ref else None
+            if it and not initiative:
+                initiative = it["fields"].get("initiative", "")
+            if not it and not initiative:
+                raise TTError("say which item or initiative this checkpoint is about")
+            cur = self.db.execute(
+                "INSERT INTO checkpoints (ref, initiative, actor, principal, text, link, attachment, source, at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (it["ref"] if it else "", initiative or "", actor, principal or "", text[:500],
+                 str(link or "")[:500], attachment, source, now_iso()))
+            if it:
+                self._log(it, actor, "checkpoint", text[:500])
+            self._bump()
+            return dict(self.db.execute("SELECT * FROM checkpoints WHERE id=?", (cur.lastrowid,)).fetchone())
+
+    def checkpoints(self, ref=None, initiative=None, limit=100):
+        sql, args = "SELECT * FROM checkpoints WHERE 1=1", []
+        if ref:
+            sql += " AND ref=?"; args.append(self.get(ref)["ref"])
+        if initiative:
+            sql += " AND initiative=?"; args.append(initiative)
+        sql += " ORDER BY id DESC LIMIT ?"; args.append(min(int(limit or 100), 500))
+        return [dict(r) for r in self.db.execute(sql, args)]
+
+    # ---- flags and asks
+    def _flag_target(self, ref, initiative, kind, principal):
+        """Who a flag goes to when nobody says: the item's assignee, else the initiative's owner."""
+        if kind == "ask":
+            return principal
+        it = self.get(ref) if ref else None
+        if it and it["assignee"]:
+            return it["assignee"]
+        slug = initiative or (it["fields"].get("initiative") if it else "")
+        if slug:
+            r = self.db.execute("SELECT owner, principal FROM initiatives WHERE slug=?", (slug,)).fetchone()
+            if r and (r["owner"] or r["principal"]):
+                return r["owner"] or r["principal"]
+        raise TTError("nobody owns that yet; say who it's for (--to NAME)")
+
+    def flag(self, actor, principal, text, ref="", initiative="", to="", urgent=False, kind="flag"):
+        text = str(text or "").strip()
+        if not text:
+            raise TTError("a flag needs some text")
+        if kind not in ("flag", "ask"):
+            raise TTError("kind must be flag or ask")
+        with self.tx():
+            it = self.get(ref) if ref else None
+            if it and not initiative:
+                initiative = it["fields"].get("initiative", "")
+            to = str(to or "").strip().lower() or self._flag_target(ref, initiative, kind, principal)
+            cur = self.db.execute(
+                "INSERT INTO flags (kind, ref, initiative, to_name, from_actor, from_principal, text, urgent,"
+                " created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (kind, it["ref"] if it else "", initiative or "", to, actor, principal or "", text[:2000],
+                 1 if urgent else 0, now_iso()))
+            if it:
+                self._log(it, actor, "asked" if kind == "ask" else "flagged", f"{to}: {text[:300]}")
+            self._bump()
+            return self._flag(cur.lastrowid)
+
+    def _flag(self, fid):
+        r = self.db.execute("SELECT * FROM flags WHERE id=?", (int(fid),)).fetchone()
+        if not r:
+            raise TTError(f"no flag F-{fid}", 404)
+        return dict(r)
+
+    def flags(self, to=None, status=None, ref=None, initiative=None, limit=100):
+        sql, args = "SELECT * FROM flags WHERE 1=1", []
+        if to:
+            sql += " AND to_name=?"; args.append(to)
+        if status:
+            st = list(FLAG_OPEN) if status == "open" else status.split(",")
+            sql += f" AND status IN ({','.join('?' * len(st))})"; args += st
+        if ref:
+            sql += " AND ref=?"; args.append(self.get(ref)["ref"])
+        if initiative:
+            sql += " AND initiative=?"; args.append(initiative)
+        sql += " ORDER BY id DESC LIMIT ?"; args.append(min(int(limit or 100), 500))
+        return [dict(r) for r in self.db.execute(sql, args)]
+
+    def set_flag(self, fid, actor, user, is_agent, status, note=""):
+        """Move a flag along. Delivery states come from the target's person (their adapter);
+        the target itself or its person acknowledges; anyone can close one."""
+        if status not in FLAG_STATES:
+            raise TTError(f"status must be one of {', '.join(FLAG_STATES)}")
+        with self.tx():
+            f = self._flag(fid)
+            target_principal = self.principal_of(f["to_name"])
+            if status in ("delivered", "failed", "escalated") and (is_agent or user != target_principal):
+                raise TTError(f"only {target_principal} (or their adapter) reports delivery of F-{f['id']}", 403)
+            if status == "acked" and actor != f["to_name"] and user != target_principal:
+                raise TTError(f"F-{f['id']} is for {f['to_name']}", 403)
+            stamp = {"delivered": "delivered_at", "acked": "acked_at", "escalated": "escalated_at"}.get(status)
+            sets = {"status": status}
+            if stamp:
+                sets[stamp] = now_iso()
+            if note:
+                sets["note"] = str(note).strip()[:1000]
+            cols = ", ".join(f"{k}=?" for k in sets)
+            self.db.execute(f"UPDATE flags SET {cols} WHERE id=?", (*sets.values(), f["id"]))
+            if f["ref"] and status in ("acked", "closed"):
+                it = self.get(f["ref"])
+                self._log(it, actor, "acknowledged" if status == "acked" else "closed a flag",
+                          f"F-{f['id']}" + (f": {note}" if note else ""))
+            self._bump()
+        return self._flag(fid)
+
+    # ---- directives ("my person told me to")
+    def directive(self, actor, principal, quote, ref="", what=""):
+        quote = " ".join(str(quote or "").split())
+        if not quote:
+            return None
+        with self.tx():
+            cur = self.db.execute("INSERT INTO directives (actor, principal, ref, what, quote, at) VALUES (?,?,?,?,?,?)",
+                                  (actor, principal or "", ref or "", str(what)[:200], quote[:1000], now_iso()))
+            self._bump()
+        return dict(self.db.execute("SELECT * FROM directives WHERE id=?", (cur.lastrowid,)).fetchone())
+
+    def directives(self, ref=None, unchecked=False, limit=100):
+        sql, args = "SELECT * FROM directives WHERE 1=1", []
+        if ref:
+            sql += " AND ref=?"; args.append(self.get(ref)["ref"])
+        if unchecked:
+            sql += " AND verified IS NULL"
+        sql += " ORDER BY id DESC LIMIT ?"; args.append(min(int(limit or 100), 500))
+        return [dict(r) for r in self.db.execute(sql, args)]
+
+    def check_directive(self, did, user, verified):
+        with self.tx():
+            r = self.db.execute("SELECT * FROM directives WHERE id=?", (int(did),)).fetchone()
+            if not r:
+                raise TTError(f"no directive {did}", 404)
+            if r["principal"] and r["principal"] != user:
+                raise TTError(f"only {r['principal']} can check that directive", 403)
+            self.db.execute("UPDATE directives SET verified=?, checked_at=? WHERE id=?",
+                            (1 if verified else 0, now_iso(), r["id"]))
+            self._bump()
+        return dict(self.db.execute("SELECT * FROM directives WHERE id=?", (int(did),)).fetchone())
 
     def projects(self):
         rows = self.db.execute(
@@ -436,6 +805,34 @@ class Store:
             "SELECT assignee FROM items WHERE assignee != '' UNION "
             "SELECT actor FROM (SELECT actor FROM events ORDER BY id DESC LIMIT 500) ORDER BY 1")
         return [r[0] for r in rows]
+
+
+# ---------------------------------------------------------------- agent identity
+
+def agent_name():
+    """The agent this process acts as: TIANTASKS_AGENT if set; inside Claude Code, the tmux
+    session it runs in (so each long-running chat has its own name), else plain 'claude'.
+    '' means a person is at the keyboard."""
+    explicit = (os.environ.get("TIANTASKS_AGENT") or "").strip().lower()
+    if explicit:
+        return explicit
+    if not os.environ.get("CLAUDECODE"):
+        return ""
+    if os.environ.get("TMUX") and os.environ.get("TMUX_PANE"):
+        try:
+            r = subprocess.run(["tmux", "display-message", "-p", "-t", os.environ["TMUX_PANE"], "#S"],
+                               capture_output=True, text=True, timeout=3)
+            name = re.sub(r"[^a-z0-9_.-]+", "-", r.stdout.strip().lower()).strip("-._")[:64]
+            if r.returncode == 0 and AGENT_NAME.fullmatch(name or "-"):
+                return name
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return "claude"
+
+
+def directive_quote(args=None):
+    """--directive "…": the instruction from this agent's person that a change carries out."""
+    return (getattr(args, "directive", None) or os.environ.get("TIANTASKS_DIRECTIVE") or "").strip()
 
 
 # ---------------------------------------------------------------- remote board
@@ -469,6 +866,7 @@ class RemoteStore:
     def __init__(self, url, token):
         self.url, self.token, self._me = url.rstrip("/"), token, None
         self.path = self.url
+        self.directive = ""
 
     def _req(self, method, path, body=None, params=None, upload=None, raw=False):
         """upload=(bytes, content_type) sends a file as-is; raw=True returns bytes instead of JSON."""
@@ -477,9 +875,11 @@ class RemoteStore:
         # Cloudflare's bot check blocks Python's default User-Agent (error 1010), so name ourselves.
         headers = {"Authorization": f"Bearer {self.token}", "X-Tiantasks": "1",
                    "Content-Type": "application/json", "User-Agent": f"tiantasks-cli/{VERSION}"}
-        agent = os.environ.get("TIANTASKS_AGENT") or ("claude" if os.environ.get("CLAUDECODE") else "")
+        agent = agent_name()
         if agent:
             headers["X-Tiantasks-Agent"] = agent
+        if self.directive and method != "GET":
+            headers["X-Tiantasks-Directive"] = quote(self.directive)
         data = json.dumps(body).encode() if body is not None else None
         if upload:
             data, headers["Content-Type"] = upload
@@ -553,6 +953,48 @@ class RemoteStore:
     def attachment_bytes(self, att_id):
         return self._req("GET", f"/api/attachments/{int(att_id)}", raw=True)
 
+    def set_fields(self, ref, actor, fields):
+        return self._req("PATCH", self._item(ref), {"fields": fields})
+
+    def agents(self):
+        return self._req("GET", "/api/agents")
+
+    def report_agent(self, name, principal, info):
+        return self._req("PUT", f"/api/agents/{quote(name)}", info)
+
+    def initiatives(self):
+        return self._req("GET", "/api/initiatives")
+
+    def put_initiative(self, slug, principal, info):
+        return self._req("PUT", f"/api/initiatives/{quote(slug, safe='/')}", info)
+
+    def checkpoint(self, actor, principal, text, ref="", initiative="", link="", attachment=None, source=None):
+        return self._req("POST", "/api/checkpoints", {"text": text, "ref": ref, "initiative": initiative,
+                                                      "link": link, "attachment": attachment, "source": source})
+
+    def checkpoints(self, ref=None, initiative=None, limit=100):
+        return self._req("GET", "/api/checkpoints", params={"ref": ref, "initiative": initiative, "limit": limit})
+
+    def flag(self, actor, principal, text, ref="", initiative="", to="", urgent=False, kind="flag"):
+        return self._req("POST", "/api/flags", {"text": text, "ref": ref, "initiative": initiative,
+                                                "to": to, "urgent": urgent, "kind": kind})
+
+    def flags(self, to=None, status=None, ref=None, initiative=None, limit=100):
+        return self._req("GET", "/api/flags", params={"to": to, "status": status, "ref": ref,
+                                                      "initiative": initiative, "limit": limit})
+
+    def set_flag(self, fid, actor, user=None, is_agent=None, status="acked", note=""):
+        if status == "acked":
+            return self._req("POST", f"/api/flags/{int(fid)}/ack", {"note": note})
+        return self._req("PATCH", f"/api/flags/{int(fid)}", {"status": status, "note": note})
+
+    def directives(self, ref=None, unchecked=False, limit=100):
+        return self._req("GET", "/api/directives", params={"ref": ref, "unchecked": "1" if unchecked else None,
+                                                           "limit": limit})
+
+    def check_directive(self, did, user, verified):
+        return self._req("PATCH", f"/api/directives/{int(did)}", {"verified": bool(verified)})
+
     def close(self):
         pass
 
@@ -567,11 +1009,7 @@ def current_actor(args=None):
         return args.actor
     if os.environ.get("TIANTASKS_ACTOR"):
         return os.environ["TIANTASKS_ACTOR"]
-    if os.environ.get("TIANTASKS_AGENT"):
-        return os.environ["TIANTASKS_AGENT"]
-    if os.environ.get("CLAUDECODE"):
-        return "claude"
-    return getpass.getuser()
+    return agent_name() or getpass.getuser()
 
 
 def current_project(args=None):
@@ -647,6 +1085,11 @@ def cmd_add(args, kind=None):
     it = args.store.create(kind, " ".join(args.text), current_project(args), current_actor(args),
                            body=args.desc or "", priority=args.priority or "",
                            tags=args.tag or [], assignee=assignee or "")
+    fields = dict(parse_field(f) for f in args.field or [])
+    if args.initiative:
+        fields["initiative"] = args.initiative
+    if fields:
+        it = args.store.set_fields(it["ref"], current_actor(args), fields)
     for path in args.file or []:
         attach_file(args, it["ref"], path)
     if args.file:
@@ -732,9 +1175,130 @@ def cmd_edit(args):
         ch["tags"] = [t for t in tags if t not in clean_tags(args.untag or [])]
     if args.move:
         ch["project"] = args.move
+    fields = dict(parse_field(f) for f in args.field or [])
+    if args.initiative is not None:
+        fields["initiative"] = args.initiative
+    if fields:
+        ch["fields"] = fields
     if not ch:
-        die("nothing to change (pass new title, -p, -d, -t, --untag or --move)")
+        die("nothing to change (pass new title, -p, -d, -t, --untag, --move, --field or --initiative)")
     emit(args, args.store.update(args.id, current_actor(args), **ch), "edited", cyan)
+
+
+def parse_field(spec):
+    key, sep, value = spec.partition("=")
+    if not sep:
+        die(f"--field wants KEY=VALUE (got {spec!r}); an empty VALUE removes the field")
+    return key.strip(), value.strip()
+
+
+def whoami_principal(args):
+    """The person behind this process: your login on a shared board, else your OS user."""
+    if isinstance(args.store, RemoteStore):
+        return args.store.me()["user"]
+    return getpass.getuser()
+
+
+def local_touch(args):
+    """On a local board nothing goes over HTTP, so record the agent here."""
+    if isinstance(args.store, Store) and agent_name():
+        args.store.touch_agent(current_actor(args), whoami_principal(args))
+
+
+def cmd_progress(args):
+    shot = None
+    if args.shot:
+        if not args.id:
+            die("--shot needs an item (it's attached to the item)")
+        shot = attach_file(args, args.id, args.shot)["id"]
+    local_touch(args)
+    cp = args.store.checkpoint(current_actor(args), whoami_principal(args), " ".join(args.text),
+                               ref=args.id or "", initiative=args.initiative or "", link=args.link or "",
+                               attachment=shot, source="agent" if agent_name() else "person")
+    if args.json:
+        print(json.dumps(cp, indent=2))
+        return
+    where = cp["ref"] or cp["initiative"]
+    print(f"{green('progress')} {where}  {cp['text']}" + (dim(f"  {cp['link']}") if cp["link"] else ""))
+
+
+def cmd_flag(args, kind="flag"):
+    local_touch(args)
+    f = args.store.flag(current_actor(args), whoami_principal(args), " ".join(args.text),
+                        ref=args.on or "", initiative=args.initiative or "", to=args.to or "",
+                        urgent=args.urgent, kind=kind)
+    if args.json:
+        print(json.dumps(f, indent=2))
+        return
+    what = "asked" if kind == "ask" else "flagged"
+    print(f"{yellow(what)} F-{f['id']} → {cyan(f['to_name'])}" + (red(" (urgent)") if f["urgent"] else "") +
+          dim(f"  {f['ref'] or f['initiative']}"))
+
+
+FLAG_MARK = {"sent": "·", "delivered": "→", "acked": "✓", "failed": "!", "escalated": "!!", "closed": "×"}
+
+
+def fmt_flag(f):
+    head = f"F-{f['id']:<4} {FLAG_MARK.get(f['status'], '?')} {f['status']:<9}"
+    where = f" [{f['ref'] or f['initiative']}]" if f["ref"] or f["initiative"] else ""
+    return (f"{head} {cyan(f['from_actor'])} → {cyan(f['to_name'])}{dim(where)}"
+            + (red(" urgent") if f["urgent"] else "") + f"\n        {f['text']}"
+            + (dim(f"\n        ack: {f['note']}") if f["note"] else ""))
+
+
+def cmd_flags(args):
+    to = None if args.all else (args.to or current_actor(args))
+    flags = args.store.flags(to=to, status=None if args.history else "open", ref=args.on)
+    if args.json:
+        print(json.dumps(flags, indent=2))
+        return
+    if not flags:
+        print(dim(f"no open flags{'' if to is None else f' for {to}'}."))
+    for f in flags:
+        print(fmt_flag(f))
+
+
+def cmd_ack(args):
+    local_touch(args)
+    fid = int(str(args.flag).upper().lstrip("F-") or 0)
+    f = args.store.set_flag(fid, current_actor(args), whoami_principal(args), bool(agent_name()),
+                            "closed" if args.close else "acked", " ".join(args.note))
+    print(f"{green('acknowledged' if not args.close else 'closed')} F-{f['id']}" + (dim(f"  {f['note']}") if f["note"] else ""))
+
+
+def cmd_team(args):
+    agents = args.store.agents()
+    inits = {i["slug"]: i for i in args.store.initiatives()}
+    if args.json:
+        print(json.dumps({"agents": agents, "initiatives": list(inits.values())}, indent=2))
+        return
+    if not agents:
+        print(dim("no agents have reported in yet."))
+    color = {"working": green, "waiting": yellow, "idle": dim, "offline": dim}
+    by_person = {}
+    for a in agents:
+        by_person.setdefault(a["principal"] or "?", []).append(a)
+    for person, group in by_person.items():
+        print(bold(f"\n{person}"))
+        for a in group:
+            st = a["state"] or "seen"
+            init = inits.get(a["initiative"], {}).get("title") or a["initiative"]
+            line = f"  {color.get(st, dim)(st.ljust(8))} {a['name']}"
+            if init:
+                line += dim(f"  · {init}")
+            print(line + dim(f"  · last seen {show_ts(a['last_seen'])}"))
+            if a["doing"]:
+                print(dim(f"           {a['doing']}"))
+
+
+def cmd_initiatives(args):
+    inits = args.store.initiatives()
+    if args.json:
+        print(json.dumps(inits, indent=2))
+        return
+    for i in inits:
+        own = f"  run by {i['owner']}" if i["owner"] else ""
+        print(f"{i['slug']:<40} {i['status']:<7} {i['title']}{dim(own)}")
 
 
 def is_local_admin():
@@ -818,6 +1382,10 @@ def pick_next(args, who, project):
     """The top item for `who`: their in-progress work first, then open items by priority.
     With --start, claims it atomically, so parallel agents never grab the same item."""
     items = args.store.list(project, ["open", "doing"], None, who)
+    pool = shared_claude_pool(args, who)
+    if not items and pool:  # a named chat also takes work queued for its person's Claude
+        items = args.store.list(project, ["open", "doing"], None, pool)
+        items = [i for i in items if i["status"] == "open"]  # not the ones another chat is doing
     if not items and args.any:
         items = args.store.list(project, ["open"], None, "")
     for it in items:
@@ -830,6 +1398,15 @@ def pick_next(args, who, project):
             if e.status != 409:
                 raise  # someone else got it first; try the next one
     return None
+
+
+def shared_claude_pool(args, who):
+    """Chats named after their tmux session still pick up work assigned to 'claude'
+    (private board) or 'claude-<person>' (shared board), the queue everyone assigns to."""
+    if args.for_ or not agent_name() or os.environ.get("TIANTASKS_AGENT"):
+        return ""
+    pool = f"claude-{args.store.me()['user']}" if isinstance(args.store, RemoteStore) else "claude"
+    return "" if pool == who else pool
 
 
 def cmd_next(args):
@@ -925,12 +1502,26 @@ def cmd_show(args):
     it = args.store.get(args.id)
     history = args.store.events(100, item_id=it["id"])  # remote boards map this to the item's ref
     comments = args.store.comments(it["ref"])
+    checkpoints = args.store.checkpoints(ref=it["ref"], limit=10)
+    flags = args.store.flags(ref=it["ref"], status="open")
     if args.json:
-        print(json.dumps({**it, "comments": comments, "history": history}, indent=2))
+        print(json.dumps({**it, "comments": comments, "history": history, "checkpoints": checkpoints,
+                          "open_flags": flags}, indent=2))
         return
     print(fmt(it))
     print(dim(f"  {it['kind']} · project {it['project']} · opened {show_ts(it['created_at'])}"
               f" by {it['created_by']}"))
+    for k, v in sorted((it.get("fields") or {}).items()):
+        print(dim(f"  {k}: ") + v)
+    if flags:
+        print(yellow("\n  open flags (answer with tt ack F-ID \"what you'll do\"):"))
+        for f in flags:
+            print("    " + fmt_flag(f).replace("\n", "\n    "))
+    if checkpoints:
+        print(dim("\n  progress (newest first):"))
+        for c in checkpoints:
+            link = dim(f"  {c['link']}") if c["link"] else ""
+            print(f"    {dim(show_ts(c['at'])[:16])}  {c['text']}{link}  {dim('— ' + c['actor'])}")
     if it["body"]:
         print("\n  " + it["body"].replace("\n", "\n  "))
     if it.get("attachments"):
@@ -989,6 +1580,7 @@ def make_handler(db_path, me, users=None):
 
         def _send(self, code, body, ctype="application/json", headers=()):
             data = body if isinstance(body, bytes) else json.dumps(body).encode()
+            self.sent_code = code
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
@@ -1078,7 +1670,19 @@ def make_handler(db_path, me, users=None):
             q = {k: v[0] for k, v in parse_qs(url.query, keep_blank_values=True).items()}
             store = Store(db_path)
             try:
-                return self._route(method, url.path, q, store, user, actor, is_admin)
+                self.agent, self.agent_header = (actor if agent else ""), agent
+                if agent:  # every agent write is attributed to its person
+                    actor = store.touch_agent(actor, user)
+                self.sent_code, self.touched_ref = 0, ""
+                self._route(method, url.path, q, store, user, actor, is_admin)
+                # "My person told me to": recorded next to the change it justified.
+                quote = self.headers.get("X-Tiantasks-Directive")
+                if quote and agent and method != "GET" and 200 <= self.sent_code < 300:
+                    mi = re.fullmatch(r"/api/items/([A-Za-z]?-?\d+).*", url.path)
+                    ref = self.touched_ref or (mi.group(1) if mi and method != "DELETE" else "")
+                    ref = store.get(ref)["ref"] if ref else ""
+                    store.directive(actor, user, unquote(quote), ref, f"{method} {url.path}")
+                return
             except TTError as e:
                 return self._send(e.status, {"error": str(e)})
             except (ValueError, KeyError, TypeError) as e:
@@ -1087,6 +1691,56 @@ def make_handler(db_path, me, users=None):
                 store.close()
 
         def _route(self, method, path, q, store, user, actor, is_admin=False):
+            is_agent = bool(self.agent)
+            # ---- agents, initiatives, checkpoints, flags, directives
+            mg = re.fullmatch(r"/api/agents/([^/]+)", path)
+            if method == "GET" and path == "/api/agents":
+                return self._send(200, store.agents())
+            if method == "PUT" and mg:
+                name = unquote(mg.group(1)).lower()
+                if is_agent and name not in (actor, self.agent_header):
+                    raise TTError("an agent can only report on itself", 403)
+                return self._send(200, store.report_agent(name, user, self._body()))
+            mi = re.fullmatch(r"/api/initiatives/(.+)", path)
+            if method == "GET" and path == "/api/initiatives":
+                return self._send(200, store.initiatives())
+            if method == "GET" and mi:
+                return self._send(200, store.initiative(unquote(mi.group(1))))
+            if method == "PUT" and mi:
+                return self._send(200, store.put_initiative(unquote(mi.group(1)), user, self._body()))
+            if method == "GET" and path == "/api/checkpoints":
+                return self._send(200, store.checkpoints(q.get("ref"), q.get("initiative"), q.get("limit") or 100))
+            if method == "POST" and path == "/api/checkpoints":
+                b = self._body()
+                self.touched_ref = b.get("ref") or ""
+                return self._send(201, store.checkpoint(actor, user, b.get("text"), b.get("ref") or "",
+                                                        b.get("initiative") or "", b.get("link") or "",
+                                                        b.get("attachment"), b.get("source") or ("agent" if is_agent else "person")))
+            mfl = re.fullmatch(r"/api/flags/(\d+)(/ack)?", path)
+            if method == "GET" and path == "/api/flags":
+                to = actor if q.get("to") == "me" else q.get("to")
+                return self._send(200, store.flags(to, q.get("status"), q.get("ref"), q.get("initiative"),
+                                                   q.get("limit") or 100))
+            if method == "POST" and path == "/api/flags":
+                b = self._body()
+                self.touched_ref = b.get("ref") or ""
+                return self._send(201, store.flag(actor, user, b.get("text"), b.get("ref") or "",
+                                                  b.get("initiative") or "", b.get("to") or "",
+                                                  bool(b.get("urgent")), b.get("kind") or "flag"))
+            if method == "POST" and mfl and mfl.group(2):
+                return self._send(200, store.set_flag(mfl.group(1), actor, user, is_agent, "acked",
+                                                      self._body().get("note", "")))
+            if method == "PATCH" and mfl:
+                b = self._body()
+                return self._send(200, store.set_flag(mfl.group(1), actor, user, is_agent, b.get("status"),
+                                                      b.get("note", "")))
+            md = re.fullmatch(r"/api/directives/(\d+)", path)
+            if method == "GET" and path == "/api/directives":
+                return self._send(200, store.directives(q.get("ref"), q.get("unchecked") == "1", q.get("limit") or 100))
+            if method == "PATCH" and md:
+                if is_agent:
+                    raise TTError("agents can't check directives", 403)
+                return self._send(200, store.check_directive(md.group(1), user, bool(self._body().get("verified"))))
             ma = re.fullmatch(r"/api/items/([A-Za-z]?-?\d+)/attachments", path)
             if method == "GET" and ma:
                 return self._send(200, store.attachments(ma.group(1)))
@@ -1125,6 +1779,10 @@ def make_handler(db_path, me, users=None):
                     "me": user, "shared": users is not None, "admin": is_admin,
                     "items": store.list(project),
                     "events": store.events(40, project),
+                    "agents": store.agents(),
+                    "initiatives": store.initiatives(),
+                    "checkpoints": store.checkpoints(limit=300),
+                    "flags": store.flags(limit=200),
                     "projects": store.projects(),
                     "assignees": sorted(set(store.assignees()) | people | agents),
                     "people": sorted(people),
@@ -1146,10 +1804,13 @@ def make_handler(db_path, me, users=None):
                 return self._send(200, store.events(200, ref=store.get(m.group(1))["ref"]))
             if method == "POST" and path == "/api/items":
                 b = self._body()
-                return self._send(201, store.create(
+                it = store.create(
                     b.get("kind", "task"), b.get("title", ""), b.get("project") or "general", actor,
                     body=b.get("body", ""), priority=b.get("priority", ""),
-                    tags=b.get("tags", []), assignee=b.get("assignee", "")))
+                    tags=b.get("tags", []), assignee=b.get("assignee", ""))
+                if b.get("fields"):
+                    it = store.set_fields(it["id"], actor, b["fields"])
+                return self._send(201, it)
             if method == "GET" and m and m.group(2) == "/comments":
                 return self._send(200, store.comments(m.group(1)))
             if method == "POST" and m and m.group(2) == "/comment":
@@ -1157,7 +1818,7 @@ def make_handler(db_path, me, users=None):
                 return self._send(200, store.comment(m.group(1), actor, b.get("text", ""), b.get("parent_id")))
             if method == "PATCH" and m and not m.group(2):
                 allowed = {"status", "note", "assignee", "priority", "title", "body", "tags", "project",
-                           "if_status", "if_assignee"}
+                           "if_status", "if_assignee", "fields"}
                 ch = {k: v for k, v in self._body().items() if k in allowed}
                 return self._send(200, store.update(m.group(1), actor, **ch))
             if method == "DELETE" and m and not m.group(2):
@@ -1179,6 +1840,9 @@ def make_handler(db_path, me, users=None):
 
         def do_DELETE(self):
             self._handle("DELETE")
+
+        def do_PUT(self):
+            self._handle("PUT")
 
     return Handler
 
@@ -1320,9 +1984,10 @@ description: The user's task and issue queues (possibly shared with teammates), 
 grouped by project (the git repo name by default). There is nothing to stage or commit. People
 watch a live page (`tt ui` opens it), so your changes show up for them right away.
 
-**Your identity:** run `tt whoami`. On a private board you are `claude`; on a shared board you
-are `claude-<user>` (for example `claude-oliver`), so each person's Claude has its own queue.
-`tt` fills this in automatically; `tt next` only hands you items assigned to you.
+**Your identity:** run `tt whoami`. Inside tmux you are named after your session (for example
+`master-courtapp-eval-flows`); otherwise `claude` on a private board or `claude-<user>` on a
+shared one. Either way the board records which person you work for. `tt next` hands you items
+assigned to you, then items queued for `claude-<user>`.
 
 ## Commands
 
@@ -1338,6 +2003,11 @@ are `claude-<user>` (for example `claude-oliver`), so each person's Claude has i
 | `tt show ID` | Full details, comment threads, screenshot names and history |
 | `tt files ID --save DIR` | Download an item's screenshots so you can look at them (then Read the printed paths) |
 | `tt attach ID FILE…` · `tt issue "title" -f shot.png` | Attach screenshots (PNG, JPEG, WebP or GIF, ≤1.9 MB each) |
+| `tt progress ID "milestone" [--link URL] [--shot FILE]` · `--initiative SLUG` | Post a milestone people see on the card (one line) |
+| `tt flags` · `tt ack F-ID "what you'll do"` | Flags people sent you, and acknowledging one |
+| `tt ask "question" [--on ID]` | Ask your person for a decision; it reaches them directly |
+| `--directive "their words"` (on any write) | Record that your person told you to do this, quoted exactly |
+| `tt team` · `tt initiatives` | Who is running what |
 
 ## Workflow
 
@@ -1355,6 +2025,23 @@ are `claude-<user>` (for example `claude-oliver`), so each person's Claude has i
 
 Keep titles to one line and put details in `-d` or `tt comment`. Use `--json` when you need to
 parse the output.
+
+## Reporting without slowing down
+
+People watch the board to know where things stand, so keep it true, but spend almost nothing on it.
+Your status, what your slices are doing, merges and gate results are filled in for you.
+Only three things need you, and each is one command:
+
+- **A real milestone** (something someone would want to know happened): `tt progress ID "Harness
+  runs end to end; 3 of 5 flows green" --link <preview>`. One line, past tense, concrete. Not for
+  routine steps; a handful per day at most.
+- **A flag arrives** (it shows up in your chat as `[Tiantasks] Flag F-12 …`): act on it, and
+  acknowledge in one line: `tt ack F-12 "Dropping the CSV export; review screen next"`.
+- **You need a decision from your person:** `tt ask "Rerun the flaky gate or skip that test?" --on ID`.
+  Don't wait silently.
+
+When you make a change because your person told you to, add `--directive "<their exact words>"`.
+It's checked against your conversation, so quote them; never paraphrase or invent one.
 
 ## Working in an agent team
 
@@ -1390,14 +2077,19 @@ Prefer the `tt` CLI (`tt help`; download it from /tiantasks). It handles identit
 ## HTTP API
 Auth: `Authorization: Bearer <token>` on a shared board. Every non-GET request must also send
 `X-Tiantasks: 1`. Agents send `X-Tiantasks-Agent: claude` (acts as `claude-<user>`) or their own
-name, e.g. `X-Tiantasks-Agent: builder-1`. Bodies are JSON. Refs accept `T-3`, `I-12` or the numeric id.
+name, e.g. `X-Tiantasks-Agent: builder-1`. The board records which person (login) each agent
+works for; if another person already has an agent by that name, yours becomes `<name>-<you>`.
+Add `X-Tiantasks-Directive: <url-encoded quote>` to a write your person told you to make.
+Bodies are JSON. Refs accept `T-3`, `I-12` or the numeric id.
 
-GET    /api/state?project=P             items + recent events + projects + assignees + people
+GET    /api/state?project=P             items + events + projects + assignees + people + agents +
+                                        initiatives + checkpoints + flags
 GET    /api/version                     change counter; poll this, refetch when it moves
 GET    /api/items?project=&status=open,doing&kind=task|issue&assignee=&grep=
 POST   /api/items                       {kind, title, project, body, priority, tags, assignee}
 GET    /api/items/REF                   one item (with its attachments)
-PATCH  /api/items/REF                   any of {status, note, assignee, priority, title, body, tags, project}
+PATCH  /api/items/REF                   any of {status, note, assignee, priority, title, body, tags, project,
+                                        fields: {key: value}}  (custom fields; "" removes; e.g. initiative)
                                         plus optional guards {if_status, if_assignee}: 409 if the item changed
 DELETE /api/items/REF
 GET    /api/items/REF/events            history, newest first
@@ -1409,6 +2101,21 @@ POST   /api/items/REF/attachments?name=shot.png   raw image bytes, Content-Type 
 GET    /api/attachments/ID              raw bytes
 DELETE /api/attachments/ID
 
+GET    /api/agents                      [{name, principal, kind, host, project, initiative, state, doing, last_seen}]
+PUT    /api/agents/NAME                 {kind, host, project, initiative, state: working|idle|waiting|offline, doing}
+GET    /api/initiatives                 [{slug, project, title, summary, status, owner, principal}]
+PUT    /api/initiatives/PROJECT/NAME    {title, project, summary, status: active|paused|done, owner}
+GET    /api/checkpoints?ref=&initiative=
+POST   /api/checkpoints                 {ref? , initiative?, text, link?, attachment?, source?: agent|auto|person}
+GET    /api/flags?to=me|NAME&status=open&ref=&initiative=
+POST   /api/flags                       {text, ref?, initiative?, to?, urgent?, kind?: flag|ask}
+                                        (to defaults to the item's assignee, else the initiative's owner;
+                                         an "ask" defaults to the asking agent's person)
+POST   /api/flags/ID/ack                {note}   the target (or its person) acknowledges
+PATCH  /api/flags/ID                    {status: delivered|failed|escalated|closed, note}
+GET    /api/directives?ref=&unchecked=1
+PATCH  /api/directives/ID               {verified: true|false}   the agent's person only
+
 priority: crit | high | med | low | ""   status: open | doing | done (a "note" on done is the resolution)
 
 ## Working an item
@@ -1417,6 +2124,12 @@ priority: crit | high | med | low | ""   status: open | doing | done (a "note" o
 2. Read the body, the comments and any screenshots before changing code.
 3. Post progress as comments (reply to questions with parent_id); attach screenshots of UI results.
 4. Finish: PATCH {status: "done", note: "<one line: what changed>"}.
+
+## Staying in touch without overhead
+- Milestones only: POST /api/checkpoints with one concrete line. A handful a day at most.
+- Check GET /api/flags?to=me&status=open when you start and between tasks; act, then
+  POST /api/flags/ID/ack with one line saying what you'll do.
+- Need your person to decide something: POST /api/flags {kind: "ask", text, ref}.
 """
 
 CLAUDE_MD_SNIPPET = """
@@ -1454,6 +2167,8 @@ def build_parser():
                         help="project name (default: git repo name)")
     common.add_argument("--as", dest="actor", default=argparse.SUPPRESS,
                         help="who is making the change (default: you, or 'claude' in Claude Code)")
+    common.add_argument("--directive", default=argparse.SUPPRESS, metavar="QUOTE",
+                        help="agents: the instruction from your person this change carries out, quoted")
 
     p = argparse.ArgumentParser(
         prog="tt",
@@ -1483,6 +2198,8 @@ def build_parser():
         sp.add_argument("-d", "--desc", help="longer description")
         sp.add_argument("--to", help="assignee (a name, 'claude' or 'me')")
         sp.add_argument("-f", "--file", action="append", help="attach a screenshot (repeatable)")
+        sp.add_argument("--initiative", metavar="SLUG", help="put it in an initiative (e.g. court/eval-flows)")
+        sp.add_argument("--field", action="append", metavar="KEY=VALUE", help="set a custom field")
         sp.add_argument("--json", action="store_true")
         if name == "add":
             sp.add_argument("-i", "--issue", action="store_true", help="make it an issue")
@@ -1514,6 +2231,44 @@ def build_parser():
     sp.add_argument("-t", "--tag", action="append")
     sp.add_argument("--untag", action="append")
     sp.add_argument("--move", metavar="PROJECT", help="move to another project")
+    sp.add_argument("--field", action="append", metavar="KEY=VALUE", help="set a custom field (empty VALUE removes it)")
+    sp.add_argument("--initiative", metavar="SLUG", help="put the item in an initiative ('' to take it out)")
+    sp.add_argument("--json", action="store_true")
+
+    sp = add_cmd("progress", cmd_progress, "post a milestone on an item or initiative (short, one line)")
+    sp.add_argument("id", metavar="ID", nargs="?", help="item (leave out with --initiative)")
+    sp.add_argument("text", nargs="+")
+    sp.add_argument("--initiative", metavar="SLUG")
+    sp.add_argument("--link", metavar="URL", help="preview, PR or doc this milestone produced")
+    sp.add_argument("--shot", metavar="FILE", help="attach a screenshot with it")
+    sp.add_argument("--json", action="store_true")
+
+    for name, kind, help in [("flag", "flag", "send a note that must reach whoever runs an item or initiative"),
+                             ("ask", "ask", "agents: ask your person for a decision (lands with them, not in a pile)")]:
+        sp = add_cmd(name, lambda a, k=kind: cmd_flag(a, k), help)
+        sp.add_argument("text", nargs="+")
+        sp.add_argument("--on", metavar="ID", help="the item it's about")
+        sp.add_argument("--initiative", metavar="SLUG")
+        sp.add_argument("--to", metavar="NAME", help="who gets it (default: the item's assignee or initiative owner"
+                                                     + ("" if kind == "flag" else "; for ask, your person") + ")")
+        sp.add_argument("--urgent", action="store_true", help="also tell their person right away")
+        sp.add_argument("--json", action="store_true")
+
+    sp = add_cmd("flags", cmd_flags, "flags and asks waiting for you (or --all)")
+    sp.add_argument("--to", metavar="NAME")
+    sp.add_argument("--all", action="store_true", help="everyone's open flags")
+    sp.add_argument("--on", metavar="ID")
+    sp.add_argument("--history", action="store_true", help="include acknowledged and closed ones")
+    sp.add_argument("--json", action="store_true")
+
+    sp = add_cmd("ack", cmd_ack, "acknowledge a flag, saying in a line what you'll do")
+    sp.add_argument("flag", metavar="F-ID")
+    sp.add_argument("note", nargs="*")
+    sp.add_argument("--close", action="store_true", help="close it instead (no longer relevant)")
+
+    sp = add_cmd("team", cmd_team, "people, their agents, and what each is working on", ("agents",))
+    sp.add_argument("--json", action="store_true")
+    sp = add_cmd("initiatives", cmd_initiatives, "initiatives and who runs them")
     sp.add_argument("--json", action="store_true")
 
     sp = add_cmd("comment", cmd_comment, "comment on an item, reply to a comment, or delete one (admin)")
@@ -1607,7 +2362,19 @@ def main(argv=None):
     try:
         cfg = None if args.cmd in ("serve", "login", "logout") else load_config()
         args.store = RemoteStore(cfg["url"], cfg["token"]) if cfg else Store()
+        quote_ = directive_quote(args)
+        if quote_ and not agent_name():
+            die("--directive is for agents recording their person's instruction")
+        if isinstance(args.store, RemoteStore):
+            args.store.directive = quote_  # the server records it with each write
+        elif agent_name() and args.cmd not in ("serve", "ui", "login", "logout", "help"):
+            local_touch(args)  # a shared board learns about agents from their requests; a local one here
         args.fn(args)
+        if quote_ and isinstance(args.store, Store):
+            ref = getattr(args, "id", None) or (getattr(args, "ids", None) or [""])[0] or getattr(args, "on", "") or ""
+            local_touch(args)
+            args.store.directive(current_actor(args), whoami_principal(args), quote_,
+                                 args.store.get(ref)["ref"] if ref else "", args.cmd)
     except TTError as e:
         die(str(e))
 
@@ -1950,6 +2717,85 @@ details.hist-d > summary { cursor: pointer; font-size: 12px; font-weight: 600; c
 #toasts { position: fixed; bottom: max(16px, env(safe-area-inset-bottom)); left: 50%; transform: translateX(-50%); display: grid; gap: 8px; z-index: 50; justify-items: center; pointer-events: none; }
 .toast { background: var(--ink); color: var(--panel); padding: 8px 14px; border-radius: 10px; font-size: 13px; box-shadow: var(--shadow-2); animation: pop .16s ease-out; }
 .toast.err { background: var(--issue); color: #fff; }
+
+/* ---------- team: people, their agents, initiatives, flags */
+#fWho, #fProject { max-width: 170px; }
+.sdot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--faint); display: inline-block; }
+.sdot.s-working { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); animation: breathe 2s ease-in-out infinite; }
+.sdot.s-waiting { background: var(--warn); }
+.sdot.s-idle { background: color-mix(in srgb, var(--muted) 70%, transparent); }
+.sdot.s-offline { background: none; border: 1.5px solid var(--faint); }
+@keyframes breathe { 50% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--ok) 8%, transparent); } }
+@media (prefers-reduced-motion: reduce) { .sdot.s-working { animation: none; } }
+.alert { background: var(--issue); color: #fff; border-radius: 999px; padding: 0 6px; font-size: 11px; font-weight: 700; }
+.team-h { display: flex; align-items: center; gap: 10px; margin: 26px 0 10px; }
+.team-h h2 { margin: 0; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+.team-h:first-child { margin-top: 0; }
+.needs { border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--line)); background: color-mix(in srgb, var(--warn) 6%, var(--panel));
+  border-radius: 14px; padding: 4px 14px 8px; }
+.need { padding: 10px 0; border-top: 1px solid var(--line); display: grid; gap: 6px; }
+.need:first-of-type { border-top: 0; }
+.need-h { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 13px; color: var(--muted); }
+.need-h b { color: var(--ink); }
+.need .md { cursor: auto; margin: 0; padding: 0; min-height: 0; }
+.need .md:hover { background: none; }
+.need-a { display: flex; gap: 6px; }
+.need-a input { flex: 1; background: var(--panel); }
+.urgent { font-size: 11px; font-weight: 700; color: #fff; background: var(--issue); border-radius: 5px; padding: 0 6px; }
+.agents { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 10px; }
+.acard { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 11px 12px; display: grid; gap: 6px; align-content: start; min-width: 0; }
+.acard.s-working { border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); }
+.acard.s-waiting { border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); }
+.ac-top { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.ac-top .help { white-space: nowrap; }
+.ac-name { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); }
+.akind { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); background: var(--chip); border-radius: 4px; padding: 0 5px; flex: none; }
+.ichip { font-size: 12px; color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); border-radius: 6px; padding: 1px 7px; display: inline-block;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ac-doing { font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+.ac-cp { font-size: 13px; border-left: 2px solid var(--accent); padding-left: 8px; overflow-wrap: anywhere; }
+.ac-cp a { color: var(--accent); }
+.ac-foot { display: flex; align-items: center; gap: 8px; }
+.ac-foot button { font-size: 12px; padding: 3px 9px; }
+.flagbox { display: grid; gap: 6px; }
+.flagbox textarea { width: 100%; background: var(--panel); font: inherit; resize: vertical; min-height: 56px; }
+.flagbox .bar2 { display: flex; align-items: center; gap: 8px; }
+.chk { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); }
+details.offline { margin-top: 10px; }
+details.offline > summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+.inits { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 10px; }
+.icard { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; display: grid; gap: 8px; min-width: 0; }
+.ic-top { display: flex; align-items: baseline; gap: 8px; }
+.ic-top h3 { margin: 0; font-size: 15px; }
+.owner { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+.owner b { color: var(--ink); font-weight: 600; }
+.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 3px; }
+.steps li { font-size: 12px; color: var(--muted); display: flex; gap: 6px; }
+.steps li::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--line); margin-top: 6px; flex: none; }
+.steps li.auto::before { background: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.ic-tix { display: flex; gap: 6px; flex-wrap: wrap; }
+.ic-tix a { font: 12px var(--mono); color: var(--muted); text-decoration: none; border: 1px solid var(--line); border-radius: 6px; padding: 0 6px; }
+.ic-tix a:hover { color: var(--accent); border-color: var(--accent); }
+.pcard { border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; display: grid; gap: 8px; margin: 4px 0 6px; background: var(--panel-2); }
+.pc-latest { font-size: 15px; font-weight: 600; line-height: 1.4; overflow-wrap: anywhere; }
+.pc-latest a { color: var(--accent); font-weight: 500; font-size: 13px; }
+.pc-latest.none { font-weight: 400; color: var(--muted); font-size: 13px; }
+.flags-l { display: grid; gap: 6px; }
+.fl { border: 1px solid var(--line); border-radius: 10px; padding: 7px 9px; font-size: 12px; background: var(--panel); display: grid; gap: 3px; }
+.fl-t { font-size: 13px; overflow-wrap: anywhere; }
+.rcpt { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; color: var(--faint); }
+.rcpt .on { color: var(--ok); font-weight: 600; }
+.rcpt .bad { color: var(--issue); font-weight: 600; }
+.fl-note { color: var(--ink); border-left: 2px solid var(--ok); padding-left: 6px; }
+.dir { color: var(--ink); }
+.dir .v { font-size: 11px; border-radius: 4px; padding: 0 5px; margin-left: 4px; }
+.dir .v.ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
+.dir .v.no { color: var(--issue); background: color-mix(in srgb, var(--issue) 12%, transparent); }
+.dir .v.pending { color: var(--muted); background: var(--chip); }
+.kc-cp { font-size: 12px; color: var(--muted); border-left: 2px solid var(--accent); padding-left: 7px; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.kc-flag { font-size: 11px; font-weight: 600; color: var(--warn); }
+.empty-team { color: var(--muted); font-size: 13px; padding: 18px; border: 1.5px dashed var(--line); border-radius: 12px; }
 </style>
 </head>
 <body>
@@ -1982,6 +2828,8 @@ details.hist-d > summary { cursor: pointer; font-size: 12px; font-weight: 600; c
   <div class="btool"><div class="chips" id="kindChips" role="group" aria-label="Type"></div><span class="grow"></span><span class="stats" id="boardHint"></span></div>
   <div class="board" id="board"></div>
 </section>
+
+<section class="pane" id="vTeam" hidden><div id="team"></div></section>
 
 <dialog id="tkt" aria-label="Ticket"><div class="m-wrap" id="mwrap"></div></dialog>
 <div id="toasts" aria-live="polite"></div>
@@ -2049,7 +2897,7 @@ async function api(method, path, body, quiet) {
 
 function typing() {
   const a = document.activeElement;
-  return !!(a && a.closest && a.closest('.item, #tkt') && ['INPUT', 'SELECT', 'TEXTAREA'].includes(a.tagName)) || dragId !== null;
+  return !!(a && a.closest && a.closest('.item, #tkt, #vTeam') && ['INPUT', 'SELECT', 'TEXTAREA'].includes(a.tagName)) || dragId !== null;
 }
 
 // ---- screenshots: shrink big images in the browser so each fits the database's ~2 MB limit
@@ -2386,7 +3234,7 @@ form.addEventListener('submit', async e => {
 // ---------------------------------------------------------------- views: Queues | Board
 const STATUS = {open: 'Not started', doing: 'In progress', done: 'Complete'};
 let view = saved.get('view', 'queues'), kindF = saved.get('kind', 'all'), dragId = null, doneLimit = 40, pageBuild = null;
-{ const v = location.hash.replace(/^#\/?/, '').split('/')[0]; if (v === 'board' || v === 'queues') view = v; }
+{ const v = location.hash.replace(/^#\/?/, '').split('/')[0]; if (['board', 'queues', 'team'].includes(v)) view = v; }
 
 const ICON = {
   plus: '<path d="M12 5v14M5 12h14"/>', x: '<path d="M18 6 6 18M6 6l12 12"/>', check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
@@ -2416,7 +3264,7 @@ function prioIcon(p) {
   const bar = (x, h, n) => `<rect x="${x}" y="${14 - h}" width="3" height="${h}" rx="1" fill="currentColor" opacity="${n <= lvl ? 1 : .22}"/>`;
   return `<svg class="pi" viewBox="0 0 16 16" role="img" aria-label="Priority ${p}"><title>${p}</title>${bar(1.5, 5, 1)}${bar(6.5, 8.5, 2)}${bar(11.5, 12, 3)}</svg>`;
 }
-const isAgent = n => !!n && (n === 'claude' || /^claude-/.test(n) || !!(S && S.people && !S.people.includes(n)));
+const isAgent = n => !!n && (n === 'claude' || /^claude-/.test(n) || !!(S && S.agents && S.agents.some(a => a.name === n)) || !!(S && S.people && !S.people.includes(n)));
 function avatar(name, lg) {
   const cls = 'av' + (lg ? ' lg' : '');
   if (!name) return `<span class="${cls} none" title="Unassigned"></span>`;
@@ -2475,11 +3323,15 @@ function md(src) {
 
 function renderViews() {
   const active = S.items.filter(i => i.status !== 'done').length;
-  $('#views').innerHTML = [['queues', 'Queues', 'list'], ['board', 'Board', 'board']].map(([k, l, icn]) =>
-    `<button role="tab" data-view="${k}" class="${view === k ? 'on' : ''}" aria-selected="${view === k}">${ic(icn)}${l}${k === 'queues' ? `<span class="n">${active}</span>` : ''}</button>`).join('');
+  const needs = needsMe().length;
+  const badge = {queues: `<span class="n">${active}</span>`, board: '', team: needs ? `<span class="alert" title="${needs} waiting for you">${needs}</span>` : ''};
+  $('#views').innerHTML = [['queues', 'Queues', 'list'], ['board', 'Board', 'board'], ['team', 'Team', 'spark']].map(([k, l, icn]) =>
+    `<button role="tab" data-view="${k}" class="${view === k ? 'on' : ''}" aria-selected="${view === k}">${icn === 'spark' ? sparkIc() : ic(icn)}${l}${badge[k]}</button>`).join('');
   $('#vQueues').hidden = view !== 'queues';
   $('#vBoard').hidden = view !== 'board';
+  $('#vTeam').hidden = view !== 'team';
   if (view === 'board') renderBoard();
+  if (view === 'team') renderTeam();
 }
 
 function setView(v) {
@@ -2489,8 +3341,10 @@ function setView(v) {
 }
 
 function cardHTML(it) {
-  const live = it.status === 'doing' && isAgent(it.assignee);
+  const live = it.status === 'doing' && isAgent(it.assignee) && agentState(agentOf(it.assignee)) !== 'offline';
   const shots = it.attachments || [];
+  const cp = it.status === 'doing' ? cpsFor('ref', it.ref)[0] : null;
+  const flagsOpen = (S.flags || []).filter(f => f.ref === it.ref && openFlag(f)).length;
   const bits = it.tags.slice(0, 3).map(t => `<span class="tag">#${esc(t)}</span>`);
   if (!project) bits.push(`<span class="tag">${esc(it.project)}</span>`);
   if (shots.length) bits.push(`<span class="cnt">${ic('clip')}${shots.length}</span>`);
@@ -2500,6 +3354,8 @@ function cardHTML(it) {
     <div class="kc-top"><span class="kind-dot ${it.kind}" title="${it.kind}"></span><span class="ref">${it.ref}</span>${prioIcon(it.priority)}
       ${live ? `<span class="working">${sparkIc()} working</span>` : ''}<span class="grow"></span>${avatar(it.assignee)}</div>
     <div class="kc-title">${esc(it.title)}</div>
+    ${cp ? `<div class="kc-cp" title="${esc(cp.text)}">${esc(cp.text)}</div>` : ''}
+    ${flagsOpen ? `<div class="kc-flag">⚑ ${flagsOpen} open flag${flagsOpen > 1 ? 's' : ''}</div>` : ''}
     ${it.status === 'done' && it.note ? `<div class="kc-note">${esc(it.note)}</div>` : ''}
     <div class="kc-meta">${bits.join('')}<span class="age">${when}</span></div>
   </article>`;
@@ -2548,6 +3404,7 @@ document.addEventListener('keydown', e => {
   if (inField || e.metaKey || e.ctrlKey || e.altKey || dlg.open || $('#tkt').open) return;
   if (e.key === 'b') setView('board');
   if (e.key === 'q') setView('queues');
+  if (e.key === 't') setView('team');
 });
 
 // ---- board drag and drop
@@ -2613,10 +3470,12 @@ async function loadModal() {
   if (!M) return;
   const ref = M.ref;
   try {
-    const [item, events, comments] = await Promise.all([
-      getJSON(`/api/items/${ref}`), getJSON(`/api/items/${ref}/events`), getJSON(`/api/items/${ref}/comments`)]);
+    const [item, events, comments, checkpoints, flags, directives] = await Promise.all([
+      getJSON(`/api/items/${ref}`), getJSON(`/api/items/${ref}/events`), getJSON(`/api/items/${ref}/comments`),
+      getJSON(`/api/checkpoints?ref=${ref}&limit=20`), getJSON(`/api/flags?ref=${ref}&limit=20`),
+      getJSON(`/api/directives?ref=${ref}&limit=50`)]);
     if (!M || M.ref !== ref) return;
-    Object.assign(M, {item, events, comments});
+    Object.assign(M, {item, events, comments, checkpoints, flags, directives});
     const a = document.activeElement;
     if (!(a && a.closest('#tkt') && ['INPUT', 'TEXTAREA'].includes(a.tagName))) renderModal();
   } catch (err) {
@@ -2636,7 +3495,7 @@ tkt.addEventListener('cancel', e => { if (M && M.editDesc) { e.preventDefault();
 
 function route() {
   const [v, ref] = location.hash.replace(/^#\/?/, '').split('/');
-  if ((v === 'board' || v === 'queues') && v !== view) { view = v; saved.set('view', v); if (S) renderViews(); }
+  if (['board', 'queues', 'team'].includes(v) && v !== view) { view = v; saved.set('view', v); if (S) renderViews(); }
   if (ref && /^[TI]-\d+$/i.test(ref)) { if (!M || M.ref !== ref.toUpperCase()) { modalPushed = false; openItem(ref); } }
   else if (M) { modalPushed = false; tkt.close(); }
 }
@@ -2649,16 +3508,25 @@ const PHRASE = {
   reprioritized: d => `set priority to <b>${esc(d)}</b>`, renamed: d => `renamed this ${esc(d)}`,
   edited: () => `edited the description`, tagged: d => `set tags to ${esc(d)}`, moved: d => `moved this ${esc(d)}`,
   noted: () => `updated the resolution note`,
+  checkpoint: d => `posted progress: <b>${esc(d)}</b>`, flagged: d => `flagged ${esc(d)}`, asked: d => `asked ${esc(d)}`,
+  acknowledged: d => `acknowledged ${esc(d)}`, 'set field': d => `set ${esc(d)}`, 'cleared field': d => `cleared ${esc(d)}`,
 };
 
 function historyHTML() {
-  const evs = (M.events || []).filter(e => !COMMENT_ACTIONS.includes(e.action));
+  const dirs = (M.directives || []).map(d => ({at: d.at, actor: d.actor, action: 'directive', detail: d.quote, verified: d.verified, principal: d.principal}));
+  const evs = [...(M.events || []).filter(e => !COMMENT_ACTIONS.includes(e.action)), ...dirs]
+    .sort((a, b) => (b.at || '').localeCompare(a.at || ''));
   if (!evs.length) return '';
   return `<details class="hist-d"><summary>History (${evs.length})</summary><div class="tl">${[...evs].reverse().map(e => {
     const bul = {started: statusIcon('doing'), paused: statusIcon('open'), reopened: statusIcon('open'), resolved: statusIcon('done')}[e.action] || '<i></i>';
     const quote = (e.action === 'resolved' || e.action === 'noted') && e.detail ? `<span class="quote">“${esc(e.detail)}”</span>` : '';
+    if (e.action === 'directive') {
+      const v = e.verified === 1 ? '<span class="v ok">verified in their chat</span>' : e.verified === 0 ? '<span class="v no">not found in their chat</span>' : '<span class="v pending">unverified</span>';
+      return `<div class="tl-ev dir"><span class="bul">${sparkIc()}</span><span>${whoTag(e.actor)} acted on <b>${esc(personName(e.principal))}</b>'s instruction:
+        <span class="quote">“${esc(e.detail)}”${v}</span><span class="help"> · ${ago(e.at)}</span></span></div>`;
+    }
     const say = PHRASE[e.action] || (d => esc(e.action) + (d ? ': ' + esc(d) : ''));
-    return `<div class="tl-ev"><span class="bul">${bul}</span><span><b>${esc(e.actor)}</b> ${say(e.detail || '')}
+    return `<div class="tl-ev"><span class="bul">${bul}</span><span>${whoTag(e.actor)} ${say(e.detail || '')}
       <span class="help" title="${esc(fullDate(e.at))}">· ${ago(e.at)}</span>${quote}</span></div>`;
   }).join('')}</div></details>`;
 }
@@ -2707,6 +3575,7 @@ function renderModal() {
   <div class="m-titlebar"><textarea class="m-title" rows="1" data-tf="title" aria-label="Title">${esc(it.title)}</textarea></div>
   <div class="m-body">
     <div class="m-main">
+      ${progressHTML(it)}
       <div class="sec" style="margin-top:6px">
         ${M.editDesc ? `<div class="editor"><textarea data-tf="body" aria-label="Description" placeholder="Describe it. Markdown works: **bold**, \`code\`, - lists, links, and T-3 / I-12 references.">${esc(it.body)}</textarea>
             <div class="bar2"><button class="primary" data-t="saveDesc">Save</button><button data-t="cancelDesc">Cancel</button><span class="help"><kbd>⌘</kbd><kbd>↵</kbd> save · <kbd>Esc</kbd> cancel</span></div></div>`
@@ -2733,6 +3602,9 @@ function renderModal() {
       <div class="prop"><label for="tPriority">Priority</label><select id="tPriority" data-tf="priority">${options(pr, it.priority)}</select></div>
       <div class="prop"><label for="tProject">Project</label><input id="tProject" data-tf="project" list="projList" value="${esc(it.project)}"></div>
       <div class="prop"><label for="tTags">Tags</label><input id="tTags" data-tf="tags" value="${esc(it.tags.join(', '))}" placeholder="ui, auth"></div>
+      <div class="prop full"><label for="tInit">Initiative</label><input id="tInit" data-tf="initiative" list="initList" value="${esc((it.fields || {}).initiative || '')}" placeholder="none">
+        <datalist id="initList">${(S.initiatives || []).map(i => `<option value="${esc(i.slug)}">${esc(i.title)}</option>`).join('')}</datalist></div>
+      ${flagsHTML(it)}
       <div class="agent full">
         <div class="agent-h">${sparkIc()} Agent handoff</div>
         <p>${isAgent(it.assignee) ? `<b>${esc(it.assignee)}</b> has this. Its updates land here live.` : 'Give this to Claude Code. It reads the description, comments and screenshots.'}</p>
@@ -2810,6 +3682,13 @@ tkt.addEventListener('click', async e => {
     await api('DELETE', `/api/attachments/${el.dataset.att}`);
     await loadModal(); return refresh(true);
   }
+  if (act === 'sendFlag') {
+    const ta = $('#tkt [data-tf=flag]'); const text = ta.value.trim();
+    if (!text) return ta.focus();
+    try { await sendFlag('ref:' + it.ref, text, $('#tkt [data-tf=urgent]').checked); }
+    catch (err) { return toast(err.message, 'err'); }
+    await loadModal(); return refresh(true);
+  }
   if (act === 'copyLink') return copyText(`${location.origin}${location.pathname}#${view}/${it.ref}`, 'Link copied');
   if (act === 'copyPrompt') return copyText(agentPrompt(it), 'Prompt copied. Paste it into Claude Code.');
   if (act === 'toAgent') {   // copy first: Safari only allows clipboard writes inside the click itself
@@ -2873,6 +3752,7 @@ tkt.addEventListener('change', e => {
   if (f === 'priority') modalSave({priority: t.value});
   if (f === 'project' && t.value.trim()) modalSave({project: t.value.trim()});
   if (f === 'tags') modalSave({tags: t.value});
+  if (f === 'initiative') modalSave({fields: {initiative: t.value.trim()}});
   if (f === 'note') modalSave({note: t.value});
 });
 let dragDepth = 0;
@@ -2886,6 +3766,189 @@ tkt.addEventListener('drop', e => {
   e.preventDefault();
   uploadToTicket(e.dataTransfer.files);
 });
+
+// ---------------------------------------------------------------- team: people, agents, initiatives
+const OFFLINE_AFTER = 10 * 60 * 1000;   // an agent nobody has heard from in 10 minutes is offline
+const agentOf = n => (S.agents || []).find(a => a.name === n);
+const since = iso => iso ? Date.now() - new Date(iso).getTime() : Infinity;
+function agentState(a) {
+  if (!a) return '';
+  if (since(a.last_seen) > OFFLINE_AFTER) return 'offline';
+  return a.state || 'idle';
+}
+const stateDot = a => { const st = agentState(a); return `<span class="sdot s-${st}" title="${st}"></span>`; };
+const personName = n => n ? n[0].toUpperCase() + n.slice(1) : '';
+const initOf = slug => (S.initiatives || []).find(i => i.slug === slug);
+const initTitle = slug => (initOf(slug) || {}).title || slug;
+const cpsFor = (key, val) => (S.checkpoints || []).filter(c => c[key] === val);   // newest first
+const openFlag = f => ['sent', 'delivered', 'failed', 'escalated'].includes(f.status);
+const needsMe = () => (S.flags || []).filter(f => f.to_name === S.me && openFlag(f));
+// "master-courtapp-eval-flows · Oliver's" — who an agent is and whose account it runs on.
+function whoTag(name) {
+  const a = agentOf(name);
+  if (!a || !a.principal || a.principal === name) return `<b>${esc(name)}</b>`;
+  return `<b>${esc(name)}</b> <span class="help">(${esc(personName(a.principal))}'s)</span>`;
+}
+function linkOut(url) {
+  return /^https?:\/\//.test(url || '') ? ` <a href="${esc(url)}" target="_blank" rel="noopener">${esc(url.replace(/^https?:\/\//, '').slice(0, 40))}</a>` : '';
+}
+let flagOpen = null;   // name of the agent or initiative whose flag box is open on the team page
+
+function flagBox(key) {
+  return `<div class="flagbox" data-flagbox="${esc(key)}">
+    <textarea data-flagtext placeholder="Change of plan, correction, question… it goes straight into the chat"></textarea>
+    <div class="bar2"><label class="chk"><input type="checkbox" data-flagurgent> Urgent (also tell their person)</label><span class="grow"></span>
+      <button data-flagcancel>Cancel</button><button class="primary" data-flagsend>Send flag</button></div></div>`;
+}
+
+function agentCard(a) {
+  const st = agentState(a);
+  const cp = a.initiative ? cpsFor('initiative', a.initiative)[0] : null;
+  const waiting = (S.flags || []).filter(f => f.to_name === a.name && openFlag(f)).length;
+  return `<article class="acard s-${st}">
+    <div class="ac-top">${stateDot(a)}<span class="ac-name" title="${esc(a.name)}">${esc(a.name)}</span>${a.kind ? `<span class="akind">${esc(a.kind)}</span>` : ''}
+      <span class="grow"></span><span class="help" title="last heard from">${ago(a.last_seen)}</span></div>
+    ${a.initiative ? `<div><span class="ichip">${esc(initTitle(a.initiative))}</span></div>` : ''}
+    ${a.doing ? `<div class="ac-doing">${esc(a.doing)}</div>` : ''}
+    ${cp ? `<div class="ac-cp">${esc(cp.text)}${linkOut(cp.link)} <span class="help">· ${ago(cp.at)}</span></div>` : ''}
+    ${flagOpen === 'agent:' + a.name ? flagBox('agent:' + a.name) : `<div class="ac-foot">
+      ${waiting ? `<span class="kc-flag">${waiting} flag${waiting > 1 ? 's' : ''} waiting</span>` : ''}<span class="grow"></span>
+      <button data-flagopen="agent:${esc(a.name)}">Flag</button></div>`}
+  </article>`;
+}
+
+function initCard(i) {
+  const cps = cpsFor('initiative', i.slug);
+  const a = agentOf(i.owner);
+  const tix = S.items.filter(t => (t.fields || {}).initiative === i.slug && t.status !== 'done');
+  return `<article class="icard">
+    <div class="ic-top"><h3>${esc(i.title)}</h3><span class="help">${esc(i.project)}</span><span class="grow"></span>
+      ${i.status !== 'active' ? `<span class="akind">${esc(i.status)}</span>` : ''}</div>
+    <div class="owner">${i.owner ? `${a ? stateDot(a) : ''} Run by ${whoTag(i.owner)} · ${a ? agentState(a) : 'not reporting'}` : 'No chat runs this yet'}</div>
+    ${i.summary ? `<div class="ac-doing">${esc(i.summary)}</div>` : ''}
+    ${cps[0] ? `<div class="ac-cp">${esc(cps[0].text)}${linkOut(cps[0].link)} <span class="help">· ${ago(cps[0].at)}</span></div>` : '<div class="help">No milestones yet.</div>'}
+    ${cps.length > 1 ? `<ol class="steps">${cps.slice(1, 5).map(c => `<li class="${c.source === 'auto' ? 'auto' : ''}">${esc(c.text)} · ${ago(c.at)}</li>`).join('')}</ol>` : ''}
+    ${tix.length ? `<div class="ic-tix">${tix.slice(0, 12).map(t => `<a href="#" class="xref" data-ref="${t.ref}" title="${esc(t.title)}">${t.ref}</a>`).join('')}</div>` : ''}
+    ${flagOpen === 'init:' + i.slug ? flagBox('init:' + i.slug) : `<div class="ac-foot"><span class="grow"></span>${i.owner ? `<button data-flagopen="init:${esc(i.slug)}">Flag</button>` : ''}</div>`}
+  </article>`;
+}
+
+function renderTeam() {
+  const needs = needsMe();
+  let html = '';
+  if (needs.length) {
+    html += `<div class="team-h"><h2>Needs you <span class="alert views">${needs.length}</span></h2></div><div class="needs">${needs.map(f => `
+      <div class="need" data-need="${f.id}">
+        <div class="need-h">${avatar(f.from_actor)} ${whoTag(f.from_actor)} ${f.kind === 'ask' ? 'asks' : 'flagged'}
+          ${f.ref ? `<a href="#" class="xref" data-ref="${f.ref}">${f.ref}</a>` : ''}${f.initiative ? `<span class="ichip">${esc(initTitle(f.initiative))}</span>` : ''}
+          <span>· ${ago(f.created_at)}</span>${f.urgent ? '<span class="urgent">urgent</span>' : ''}</div>
+        <div class="md">${md(f.text)}</div>
+        <div class="need-a"><input data-answer="${f.id}" placeholder="Answer: goes straight back into ${esc(f.from_actor)}"><button class="primary" data-answersend="${f.id}">Send</button><button data-needdone="${f.id}" title="Mark handled without answering">Done</button></div>
+      </div>`).join('')}</div>`;
+  }
+  const agents = S.agents || [];
+  const byPerson = new Map((S.people || [S.me]).map(p => [p, []]));
+  agents.forEach(a => { const p = a.principal || '?'; if (!byPerson.has(p)) byPerson.set(p, []); byPerson.get(p).push(a); });
+  const order = {working: 0, waiting: 1, idle: 2, offline: 3};
+  for (const [person, list] of byPerson) {
+    const sorted = list.filter(a => agentState(a) !== 'offline').sort((x, y) => order[agentState(x)] - order[agentState(y)] || x.name.localeCompare(y.name));
+    // Auditors/assistants shadow a master; they fold away so the masters stay readable.
+    const live = sorted.filter(a => a.kind !== 'assistant');
+    const helpers = sorted.filter(a => a.kind === 'assistant');
+    const gone = list.filter(a => agentState(a) === 'offline');
+    const working = live.filter(a => agentState(a) === 'working').length;
+    html += `<div class="team-h"><h2>${avatar(person, true)} ${esc(personName(person))}</h2><span class="count">${live.length} chat${live.length === 1 ? '' : 's'} live${working ? ` · ${working} working` : ''}</span></div>`;
+    html += live.length ? `<div class="agents">${live.map(agentCard).join('')}</div>`
+      : `<div class="empty-team">No chats reporting for ${esc(personName(person))}.${person === S.me ? ' Chats appear here once the box adapter runs, or when one uses <code>tt</code>.' : ''}</div>`;
+    if (helpers.length) html += `<details class="offline"><summary>${helpers.length} assistant${helpers.length === 1 ? '' : 's'} (auditors)</summary><div class="agents" style="margin-top:8px">${helpers.map(agentCard).join('')}</div></details>`;
+    if (gone.length) html += `<details class="offline"><summary>${gone.length} offline</summary><div class="agents" style="margin-top:8px">${gone.map(agentCard).join('')}</div></details>`;
+  }
+  const inits = (S.initiatives || []).filter(i => i.status !== 'done' && (!project || i.project === project));
+  html += `<div class="team-h"><h2>Initiatives</h2><span class="count">${inits.length}</span></div>`;
+  html += inits.length ? `<div class="inits">${inits.map(initCard).join('')}</div>` : '<div class="empty-team">No initiatives yet.</div>';
+  $('#team').innerHTML = html;
+}
+
+async function sendFlag(key, text, urgent) {
+  const [kind, name] = [key.slice(0, key.indexOf(':')), key.slice(key.indexOf(':') + 1)];
+  const body = kind === 'agent' ? {to: name, text, urgent} : kind === 'init' ? {initiative: name, text, urgent} : {ref: name, text, urgent};
+  const f = await api('POST', '/api/flags', body, true);
+  toast(`Flag sent to ${f.to_name}`);
+  return f;
+}
+
+$('#vTeam').addEventListener('click', async e => {
+  const t = e.target;
+  const open = t.closest('[data-flagopen]');
+  if (open) { flagOpen = open.dataset.flagopen; renderTeam(); const ta = $('#vTeam [data-flagtext]'); if (ta) ta.focus(); return; }
+  if (t.closest('[data-flagcancel]')) { flagOpen = null; return renderTeam(); }
+  if (t.closest('[data-flagsend]')) {
+    const box = t.closest('[data-flagbox]');
+    const text = $('[data-flagtext]', box).value.trim();
+    if (!text) return $('[data-flagtext]', box).focus();
+    try { await sendFlag(box.dataset.flagbox, text, $('[data-flagurgent]', box).checked); flagOpen = null; }
+    catch (err) { return toast(err.message, 'err'); }
+    return refresh(true);
+  }
+  const ans = t.closest('[data-answersend]');
+  if (ans) {
+    const f = S.flags.find(x => x.id === +ans.dataset.answersend);
+    const input = $(`#vTeam [data-answer="${f.id}"]`);
+    const text = input.value.trim();
+    if (!text) return input.focus();
+    try {
+      await api('POST', '/api/flags', {to: f.from_actor, text, ref: f.ref, initiative: f.initiative}, true);
+      await api('PATCH', `/api/flags/${f.id}`, {status: 'acked', note: text}, true);
+      toast(`Answer sent to ${f.from_actor}`);
+    } catch (err) { return toast(err.message, 'err'); }
+    return refresh(true);
+  }
+  const done = t.closest('[data-needdone]');
+  if (done) {
+    try { await api('PATCH', `/api/flags/${done.dataset.needdone}`, {status: 'acked'}, true); } catch (err) { return toast(err.message, 'err'); }
+    return refresh(true);
+  }
+});
+$('#vTeam').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && e.target.dataset.answer !== undefined) { e.preventDefault(); $(`#vTeam [data-answersend="${e.target.dataset.answer}"]`).click(); }
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && e.target.dataset.flagtext !== undefined) { e.preventDefault(); e.target.closest('[data-flagbox]').querySelector('[data-flagsend]').click(); }
+  if (e.key === 'Escape' && e.target.dataset.flagtext !== undefined) { flagOpen = null; renderTeam(); }
+});
+
+// ---- the ticket modal's progress card and flags
+function progressHTML(it) {
+  const cps = M.checkpoints || [];
+  const a = agentOf(it.assignee);
+  const slug = (it.fields || {}).initiative;
+  if (!cps.length && !a && !slug) return '';
+  return `<div class="pcard">
+    <div class="owner">${it.assignee ? `${a ? stateDot(a) : ''}${whoTag(it.assignee)}${a ? ` · ${agentState(a)} · heard from ${ago(a.last_seen)}` : ''}` : 'Nobody has this yet'}
+      ${slug ? `<span class="grow"></span><span class="ichip">${esc(initTitle(slug))}</span>` : ''}</div>
+    ${a && a.doing ? `<div class="ac-doing">${esc(a.doing)}</div>` : ''}
+    ${cps[0] ? `<div class="pc-latest">${esc(cps[0].text)}${linkOut(cps[0].link)} <span class="help">· ${ago(cps[0].at)} · ${esc(cps[0].actor)}</span></div>`
+      : '<div class="pc-latest none">No milestones posted yet.</div>'}
+    ${cps.length > 1 ? `<ol class="steps">${cps.slice(1, 6).map(c => `<li class="${c.source === 'auto' ? 'auto' : ''}">${esc(c.text)} · ${ago(c.at)}</li>`).join('')}</ol>` : ''}
+  </div>`;
+}
+
+function receipt(f) {
+  const steps = [['sent', f.created_at], ['delivered', f.delivered_at], ['acknowledged', f.acked_at]];
+  const bad = f.status === 'failed' ? '<span class="bad">not delivered</span>' : f.status === 'escalated' ? '<span class="bad">escalated to their person</span>' : '';
+  return `<div class="rcpt">${steps.map(([l, t]) => `<span class="${t ? 'on' : ''}" title="${t ? esc(fullDate(t)) : ''}">${l}</span>`).join(' → ')}${bad ? ' · ' + bad : ''}${f.status === 'closed' ? ' · closed' : ''}</div>`;
+}
+
+function flagsHTML(it) {
+  const list = M.flags || [];
+  const owner = it.assignee || (initOf((it.fields || {}).initiative) || {}).owner || '';
+  return `<div class="prop full"><span class="lbl">Flag ${owner ? esc(owner) : 'the owner'}</span>
+    <div class="flagbox"><textarea data-tf="flag" rows="2" placeholder="${owner ? 'Goes straight into their chat. They acknowledge it here.' : 'Assign this (or put it in an initiative) so a flag has somewhere to go.'}"></textarea>
+      <div class="bar2"><label class="chk"><input type="checkbox" data-tf="urgent"> Urgent</label><span class="grow"></span><button data-t="sendFlag">Send flag</button></div></div>
+    ${list.length ? `<div class="flags-l">${list.map(f => `<div class="fl">
+      <div class="fl-t">${f.kind === 'ask' ? '❓ ' : ''}${esc(f.text)}</div>
+      <div class="help">F-${f.id} · ${esc(f.from_actor)} → ${esc(f.to_name)}${f.urgent ? ' · <span class="urgent">urgent</span>' : ''}</div>
+      ${receipt(f)}${f.note ? `<div class="fl-note">${esc(f.note)}</div>` : ''}</div>`).join('')}</div>` : ''}
+  </div>`;
+}
 
 // ---- theme: Auto (follows the system) → Dark → Light
 const THEMES = [['auto', '◐', 'Theme: auto (follows your system)'], ['dark', '☾', 'Theme: dark'], ['light', '☀', 'Theme: light']];
