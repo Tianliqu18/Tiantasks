@@ -4,6 +4,13 @@ set -euo pipefail
 cd "$(dirname "$0")"
 python3 - <<'PY'
 import runpy
+# Cloudflare's Python (3.13.3) ships without _sqlite3. tiantasks only touches sqlite3 inside
+# functions (Store.__init__), never at import time, so a stub module is enough to run_path it.
+try:
+    import sqlite3  # noqa: F401
+except ImportError:
+    import sys, types
+    sys.modules["sqlite3"] = types.ModuleType("sqlite3")
 g = runpy.run_path("../tiantasks")  # run_path doesn't trigger main()
 open("src/page.html", "w").write(g["PAGE"])
 open("src/login.html", "w").write(g["LOGIN_PAGE"])
