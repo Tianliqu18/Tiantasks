@@ -54,7 +54,17 @@ const COLUMNS = [
   { title: "IN PROGRESS", empty: "Nothing in progress." },
   { title: "DONE", empty: "Nothing done yet." },
 ];
-const BOARD_KEYS = "←→ column  ↑↓ select  ⏎ details  n new  a assign  s start  d done  < > move  c comment  p priority  f project  / search  t theme  ? help  q quit";
+const BOARD_KEYS = "Tab team  ←→ column  ↑↓ select  ⏎ details  n new  a assign  s start  d done  < > move  c comment  p priority  f project  / search  t theme  ? help  q quit";
+const TEAM_KEYS = "Tab board  ↑↓ select  ⏎ open/expand  f flag  a answer  d done  r refresh  t theme  ? help  q quit";
+
+// ---- Team view: the same rules as the web page's Team tab
+const OFFLINE_AFTER = 10 * 60 * 1000; // an agent nobody has heard from in 10 minutes is offline
+const since = (iso) => (iso ? Date.now() - new Date(iso).getTime() : Infinity);
+const agentState = (a) => (!a ? "" : since(a.last_seen) > OFFLINE_AFTER ? "offline" : a.state || "idle");
+const STATE_ORDER = { working: 0, waiting: 1, idle: 2, offline: 3 };
+const openFlag = (f) => ["sent", "delivered", "failed", "escalated"].includes(f.status);
+const personName = (n) => (n ? n[0].toUpperCase() + n.slice(1) : "");
+const stateColor = (st) => ({ working: TH.ok, waiting: TH.warn, idle: TH.muted, offline: TH.border })[st] || TH.muted;
 
 // ------------------------------------------------------------------ helpers
 
@@ -143,6 +153,7 @@ function Card({ it, selected, width, showProject }) {
   if (it.attachments?.length) meta.push(<Text key="f" color={TH.muted}>📎{it.attachments.length}</Text>);
   for (const t of it.tags || []) meta.push(<Text key={"t" + t} color={TH.tag}>#{t}</Text>);
   if (showProject) meta.push(<Text key="pr" color={TH.muted}>{it.project}</Text>);
+  if (it.milestone) meta.push(<Text key="ms" color={TH.accent}>◆ {it.milestone}</Text>);
   if (it.status === "doing") meta.push(<Text key="s" color={TH.warn}>started {ago(it.updated_at)}</Text>);
   if (it.status === "done") meta.push(<Text key="d" color={TH.ok}>✓ {it.note || ago(it.resolved_at)}</Text>);
   const done = it.status === "done";
@@ -225,6 +236,7 @@ function App() {
     S: null, live: true, flash: "", col: 0, selIds: [null, null, null], mode: "board", input: null,
     assignIdx: 0, projIdx: -1, search: "", detailId: null, history: [], scroll: 0, version: null,
     comments: [], cSel: -1, openThreads: new Set(), pendingComment: null, previews: new Map(),
+    view: "board", tSel: 0, tKey: null, tOpen: new Set(), tScroll: 0,
   }).current;
   const queue = useRef(Promise.resolve());
   // Server calls run one at a time, in the order the keys were pressed.
@@ -276,7 +288,9 @@ function App() {
   const derive = () => {
     const project = ui.projIdx >= 0 && ui.S ? ui.S.projects[ui.projIdx]?.project : null;
     const q = ui.search.toLowerCase();
-    const items = (ui.S?.items || []).filter(
+    const latest = new Map();
+    for (const c of ui.S?.checkpoints || []) if (c.ref && !latest.has(c.ref)) latest.set(c.ref, c.text); // newest first
+    const items = (ui.S?.items || []).map((i) => (latest.has(i.ref) ? { ...i, milestone: latest.get(i.ref) } : i)).filter(
       (i) => (!project || i.project === project) &&
         (!q || `${i.ref} ${i.title} ${i.body} ${i.assignee} ${(i.tags || []).join(" ")}`.toLowerCase().includes(q)),
     );
@@ -405,12 +419,135 @@ function App() {
       .catch((e) => flash("✗ " + e.message.split("\n")[0]));
   };
 
+  // ---- Team view rows: headings and notes, plus selectable asks, agents, folds and initiatives
+  const agentOf = (name) => (ui.S?.agents || []).find((a) => a.name === name);
+  const checkpoints = (key, val) => (ui.S?.checkpoints || []).filter((c) => c[key] === val); // newest first
+  const teamRows = () => {
+    const S = ui.S;
+    const rows = [];
+    const needs = (S.flags || []).filter((f) => f.to_name === S.me && openFlag(f));
+    if (needs.length) {
+      rows.push({ type: "h", text: "Needs you", sub: String(needs.length), color: TH.issue });
+      needs.forEach((f) => rows.push({ type: "need", f }));
+    }
+    const byPerson = new Map((S.people || [S.me]).map((p) => [p, []]));
+    for (const a of S.agents || []) {
+      const who = a.principal || "?";
+      if (!byPerson.has(who)) byPerson.set(who, []);
+      byPerson.get(who).push(a);
+    }
+    for (const [person, list] of byPerson) {
+      const sorted = list.filter((a) => agentState(a) !== "offline")
+        .sort((x, y) => STATE_ORDER[agentState(x)] - STATE_ORDER[agentState(y)] || x.name.localeCompare(y.name));
+      const live = sorted.filter((a) => a.kind !== "assistant"); // auditors/assistants fold away
+      const helpers = sorted.filter((a) => a.kind === "assistant");
+      const gone = list.filter((a) => agentState(a) === "offline");
+      const working = live.filter((a) => agentState(a) === "working").length;
+      rows.push({ type: "h", text: personName(person) + (person === S.me ? " (you)" : ""),
+        sub: `${live.length} chat${live.length === 1 ? "" : "s"} live${working ? ` · ${working} working` : ""}` });
+      if (!live.length) rows.push({ type: "note", text: `No chats reporting for ${personName(person)}.` });
+      live.forEach((a) => rows.push({ type: "agent", a }));
+      for (const [key, label, group] of [
+        [`helpers:${person}`, `${helpers.length} assistant${helpers.length === 1 ? "" : "s"} (auditors)`, helpers],
+        [`offline:${person}`, `${gone.length} offline`, gone],
+      ]) {
+        if (!group.length) continue;
+        const open = ui.tOpen.has(key);
+        rows.push({ type: "fold", key, label, open });
+        if (open) group.forEach((a) => rows.push({ type: "agent", a, nested: true }));
+      }
+    }
+    const { project } = derive();
+    const inits = (S.initiatives || []).filter((i) => i.status !== "done" && (!project || i.project === project));
+    rows.push({ type: "h", text: "Initiatives", sub: String(inits.length) });
+    if (!inits.length) rows.push({ type: "note", text: "No initiatives yet." });
+    inits.forEach((i) => rows.push({ type: "init", i }));
+    return rows;
+  };
+  const isSelectable = (r) => r.type === "need" || r.type === "agent" || r.type === "fold" || r.type === "init";
+  const rowKey = (r) => ({ need: () => `need:${r.f.id}`, agent: () => `agent:${r.a.name}`, fold: () => `fold:${r.key}`, init: () => `init:${r.i.slug}` })[r.type]();
+  // The selection follows the thing itself (an agent, an ask…), not a row number, so rows moving
+  // when an ask arrives or is answered never shift a flag onto the wrong agent.
+  const teamSelected = () => {
+    const sel = teamRows().filter(isSelectable);
+    const at = ui.tKey ? sel.findIndex((r) => rowKey(r) === ui.tKey) : -1;
+    ui.tSel = at >= 0 ? at : Math.max(0, Math.min(ui.tSel, sel.length - 1));
+    const row = sel[ui.tSel] || null;
+    ui.tKey = row ? rowKey(row) : null;
+    return row;
+  };
+  const teamMove = (delta) => {
+    const sel = teamRows().filter(isSelectable);
+    teamSelected();
+    ui.tSel = Math.max(0, Math.min(sel.length - 1, ui.tSel + delta));
+    ui.tKey = sel[ui.tSel] ? rowKey(sel[ui.tSel]) : null;
+    bump();
+  };
+  const openItemDetail = (ref) => {
+    const it = ui.S.items.find((i) => i.ref === ref);
+    if (!it) return flash(`✗ ${ref} isn't on this board`);
+    Object.assign(ui, { detailId: it.id, scroll: 0, history: [], comments: [], cSel: -1, mode: "detail" });
+    bump();
+    enqueue(load);
+  };
+  const teamKey = (inp, key) => {
+    const sel = teamSelected();
+    if (key.tab) return ((ui.view = "board"), bump());
+    if (inp === "q") return exit();
+    if (inp === "?") return ((ui.mode = "help"), bump());
+    if (inp === "r") return enqueue(load).then(() => flash("refreshed"));
+    if (key.upArrow || inp === "k") return teamMove(-1);
+    if (key.downArrow || inp === "j") return teamMove(1);
+    if (key.pageDown || inp === "J") return ((ui.tScroll += 5), bump());
+    if (key.pageUp || inp === "K") return ((ui.tScroll = Math.max(0, ui.tScroll - 5)), bump());
+    if (!sel) return;
+    if (sel.type === "fold" && (key.return || inp === " " || key.rightArrow || key.leftArrow)) {
+      sel.open ? ui.tOpen.delete(sel.key) : ui.tOpen.add(sel.key);
+      return bump();
+    }
+    if (sel.type === "need") {
+      const f = sel.f;
+      if (inp === "a" || key.return) return ask("answer", `Answer ${f.from_actor}:`, { flag: f, hint: "⏎ send it back to the chat · Esc cancel" });
+      if (inp === "d") {
+        return save(`marked handled`, () => api("PATCH", `/api/flags/${f.id}`, { status: "acked" }));
+      }
+      if (inp === "o" && f.ref) return openItemDetail(f.ref);
+    }
+    if (sel.type === "agent") {
+      if (inp === "f") return ask("flag", `Flag ${sel.a.name}:`, { target: { to: sel.a.name }, urgent: false, hint: "⏎ send · Tab urgent (also tells their person) · Esc cancel" });
+      if (key.return) {
+        const mine = ui.S.items.find((i) => i.assignee === sel.a.name && i.status === "doing");
+        return mine ? openItemDetail(mine.ref) : flash(`${sel.a.name} has no ticket in progress`);
+      }
+    }
+    if (sel.type === "init") {
+      if (inp === "f") {
+        if (!sel.i.owner) return flash("✗ no chat runs this initiative yet, so there's no one to flag");
+        return ask("flag", `Flag ${sel.i.title}:`, { target: { initiative: sel.i.slug }, urgent: false, hint: "⏎ send · Tab urgent (also tells their person) · Esc cancel" });
+      }
+      if (key.return) {
+        const t = ui.S.items.find((i) => (i.fields || {}).initiative === sel.i.slug && i.status !== "done");
+        return t ? openItemDetail(t.ref) : flash("no open tickets in this initiative");
+      }
+    }
+  };
+
   const submitInput = () => {
     const f = ui.input;
     const v = f.value.trim();
     ui.input = null;
     ui.mode = f.fromDetail ? "detail" : "board";
     bump();
+    if (f.purpose === "answer" && v) {
+      const fl = f.flag;
+      return save(`answer sent to ${fl.from_actor}`, async () => {
+        await api("POST", "/api/flags", { to: fl.from_actor, text: v, ref: fl.ref, initiative: fl.initiative });
+        await api("PATCH", `/api/flags/${fl.id}`, { status: "acked", note: v });
+      });
+    }
+    if (f.purpose === "flag" && v) {
+      return save(`flag sent${f.urgent ? " (urgent)" : ""}`, () => api("POST", "/api/flags", { ...f.target, text: v, urgent: f.urgent }));
+    }
     if (f.purpose === "new-title") return v && ask("new-desc", `Description for “${v}” (optional):`, { kind: f.kind, title: v });
     if (f.purpose === "new-desc") {
       const { project } = derive();
@@ -445,6 +582,7 @@ function App() {
     if (key.return) return submitInput();
     if (key.tab) {
       if (f.purpose === "new-title") f.kind = f.kind === "task" ? "issue" : "task";
+      if (f.purpose === "flag") f.urgent = !f.urgent;
       return bump();
     }
     if (key.backspace || key.delete) f.value = f.value.slice(0, -1);
@@ -541,7 +679,9 @@ function App() {
       }
       return itemKey(inp, key, d.detailItem);
     }
+    if (ui.view === "team") return teamKey(inp, key);
     // board
+    if (key.tab) return ((ui.view = "team"), bump());
     if (inp === "q") return exit();
     if (inp === "?") return ((ui.mode = "help"), bump());
     if (key.shift && (key.leftArrow || key.rightArrow)) return itemKey(inp, key, d.current);
@@ -606,11 +746,16 @@ function App() {
   const open = S.items.filter((i) => i.status !== "done");
   const doing = S.items.filter((i) => i.status === "doing");
   const host = BASE.replace(/^https?:\/\//, "");
+  const needsCount = (S.flags || []).filter((f) => f.to_name === S.me && openFlag(f)).length;
 
   const header = (
     <Box width={cols}>
       <Text wrap="truncate-end">
-        <Text bold color={TH.accent}>Tiantasks</Text> <Text color={ui.live ? TH.ok : TH.issue}>●</Text>{" "}
+        <Text bold color={TH.accent}>Tiantasks</Text> <Text color={ui.live ? TH.ok : TH.issue}>●</Text>{"  "}
+        <Text bold={ui.view === "board"} color={ui.view === "board" ? TH.fg : TH.muted} underline={ui.view === "board"}>Board</Text>
+        <Text color={TH.border}> │ </Text>
+        <Text bold={ui.view === "team"} color={ui.view === "team" ? TH.fg : TH.muted} underline={ui.view === "team"}>Team</Text>
+        {needsCount ? <Text color={TH.issue} bold> {needsCount} need you</Text> : null}{"  "}
         <Text color={TH.muted}>{host}</Text>{"  "}
         <Text color={TH.muted}>project</Text> {project || "all"}
         {ui.search ? <Text>{"  "}<Text color={TH.muted}>search</Text> “{ui.search}”</Text> : null}
@@ -637,7 +782,9 @@ function App() {
           ["In details:", ""], ["↑ ↓", "select screenshots and comments (J K scroll the page)"],
           ["o  (or ⏎ on a screenshot)", "open the screenshot full size (Preview on a Mac)"], ["⏎ on a reply line", "expand / collapse the thread"],
           ["r  or  ⏎", "reply to the selected comment"], ["c", "new comment"], ["⌫", "delete the selected comment (admins)"],
-          ["Esc", "leave the comments, then close"],
+          ["Esc", "leave the comments, then close"], ["", ""],
+          ["Tab", "switch between Board and Team"], ["Team: f", "flag the selected agent or initiative"],
+          ["Team: a / d", "answer an ask / mark it handled"], ["Team: ⏎", "open its ticket, or expand a folded group"],
         ].map(([k, desc], i) => (
           <Text key={i}>
             <Text color={desc ? TH.accent : TH.fg} bold={!desc}>{k.padEnd(22)}</Text>
@@ -666,6 +813,20 @@ function App() {
         <Text color={TH.muted}>opened {ago(it.created_at)} by {it.created_by}{it.status === "done" ? ` · resolved ${ago(it.resolved_at)}` : ""}</Text>,
         <Text> </Text>,
       );
+      // Progress: who has it, what their chat is doing, and the milestones posted on it.
+      const cps = checkpoints("ref", it.ref);
+      const owner = agentOf(it.assignee);
+      if (cps.length || owner) {
+        lines.push(<Text bold color={TH.accent}>Progress</Text>);
+        if (owner) {
+          lines.push(<Text wrap="truncate-end">  <Text color={stateColor(agentState(owner))}>●</Text> {owner.name}<Text color={TH.muted}> · {agentState(owner)} · heard from {ago(owner.last_seen)}</Text></Text>);
+          if (owner.doing) lines.push(<Text wrap="truncate-end">    {owner.doing}</Text>);
+        }
+        if (!cps.length) lines.push(<Text color={TH.muted}>  no milestones posted yet</Text>);
+        cps.slice(0, 6).forEach((c, n) => lines.push(
+          <Text wrap="truncate-end">  <Text color={n ? TH.muted : TH.accent}>◆ {c.text}</Text><Text color={TH.muted}> · {ago(c.at)} · {c.actor}{c.link ? " · " + c.link : ""}</Text></Text>));
+        lines.push(<Text> </Text>);
+      }
       if (it.status === "done" && it.note) lines.push(<Text color={TH.ok}>✓ {it.note}</Text>, <Text> </Text>);
       for (const l of it.body ? wrap(it.body, w) : ["(no description)"]) lines.push(it.body ? <Text>{l}</Text> : <Text color={TH.muted}>{l}</Text>);
       const rows = detailRows();
@@ -762,6 +923,90 @@ function App() {
         {lines.slice(top, top + room).map((l, i) => <Box key={top + i}>{l}</Box>)}
       </Box>
     );
+  } else if (ui.view === "team") {
+    const w = cols - 4;
+    const lines = [];
+    const rowsT = teamRows();
+    const selRow = teamSelected();
+    let selLines = null;
+    for (const row of rowsT) {
+      const selected = row === selRow;
+      const bg = selected ? TH.selBg : undefined;
+      const mark = <Text color={TH.accent} backgroundColor={bg}>{selected ? "▌" : " "}</Text>;
+      const start = lines.length;
+      const dim = (t) => <Text color={TH.muted} backgroundColor={bg}>{t}</Text>;
+      if (row.type === "h") {
+        if (lines.length) lines.push(<Text> </Text>);
+        lines.push(<Text><Text bold color={row.color || TH.accent}>{row.text}</Text><Text color={TH.muted}>  {row.sub}</Text></Text>);
+      } else if (row.type === "note") {
+        lines.push(<Text color={TH.muted}>  {row.text}</Text>);
+      } else if (row.type === "fold") {
+        lines.push(<Text backgroundColor={bg}>{mark}<Text color={TH.accent} backgroundColor={bg}> {row.open ? "▾" : "▸"} {row.label}</Text>{selected ? dim("  ⏎ " + (row.open ? "fold" : "show")) : null}</Text>);
+      } else if (row.type === "need") {
+        const f = row.f;
+        lines.push(
+          <Text backgroundColor={bg}>
+            {mark}<Text bold color={TH.who} backgroundColor={bg}> {f.from_actor}</Text>
+            {dim(` ${f.kind === "ask" ? "asks" : "flagged"}${f.ref ? " " + f.ref : ""}${f.initiative ? " · " + f.initiative : ""} · ${ago(f.created_at)}`)}
+            {f.urgent ? <Text color={TH.issue} bold backgroundColor={bg}>  urgent</Text> : null}
+          </Text>,
+        );
+        for (const l of wrap(f.text, w - 6)) lines.push(<Text backgroundColor={bg}>{mark}<Text backgroundColor={bg}>    {l}</Text></Text>);
+        if (selected) lines.push(<Text color={TH.muted}>{"     "}a answer (goes straight back to the chat) · d mark handled{f.ref ? " · o open " + f.ref : ""}</Text>);
+      } else if (row.type === "agent") {
+        const a = row.a;
+        const st = agentState(a);
+        const cp = a.initiative ? checkpoints("initiative", a.initiative)[0] : null;
+        const waiting = (ui.S.flags || []).filter((x) => x.to_name === a.name && openFlag(x)).length;
+        const indent = row.nested ? "   " : " ";
+        lines.push(
+          <Text backgroundColor={bg}>
+            {mark}<Text backgroundColor={bg}>{indent}</Text><Text color={stateColor(st)} backgroundColor={bg}>●</Text>
+            <Text bold backgroundColor={bg}> {a.name}</Text>
+            {dim(` ${st}${a.kind ? " · " + a.kind : ""}${a.initiative ? " · " + a.initiative : ""} · heard from ${ago(a.last_seen)}`)}
+            {waiting ? <Text color={TH.warn} backgroundColor={bg}>  {waiting} flag{waiting > 1 ? "s" : ""} waiting</Text> : null}
+          </Text>,
+        );
+        if (a.doing) lines.push(<Text backgroundColor={bg} wrap="truncate-end">{mark}{indent}{"   "}<Text backgroundColor={bg}>{a.doing}</Text></Text>);
+        if (cp) lines.push(<Text backgroundColor={bg} wrap="truncate-end">{mark}{indent}{"   "}<Text color={TH.accent} backgroundColor={bg}>◆ {cp.text}</Text>{dim(` · ${ago(cp.at)}`)}</Text>);
+        if (selected) lines.push(<Text color={TH.muted}>{indent}{"    "}f flag this chat · ⏎ open its ticket in progress</Text>);
+      } else if (row.type === "init") {
+        const i = row.i;
+        const owner = agentOf(i.owner);
+        const cps = checkpoints("initiative", i.slug);
+        const tix = ui.S.items.filter((t) => (t.fields || {}).initiative === i.slug && t.status !== "done");
+        lines.push(
+          <Text backgroundColor={bg}>
+            {mark}<Text bold backgroundColor={bg}> {i.title}</Text>{dim(`  ${i.project}${i.status !== "active" ? " · " + i.status : ""}`)}
+          </Text>,
+        );
+        lines.push(
+          <Text backgroundColor={bg} wrap="truncate-end">
+            {mark}{"    "}
+            {i.owner ? <Text backgroundColor={bg}><Text color={stateColor(agentState(owner))} backgroundColor={bg}>●</Text> run by {i.owner}{owner ? ` · ${agentState(owner)}` : " · not reporting"}</Text> : dim("no chat runs this yet")}
+          </Text>,
+        );
+        if (i.summary) for (const l of wrap(i.summary, w - 6)) lines.push(<Text backgroundColor={bg}>{mark}{"    "}{dim(l)}</Text>);
+        if (cps[0]) lines.push(<Text backgroundColor={bg} wrap="truncate-end">{mark}{"    "}<Text color={TH.accent} backgroundColor={bg}>◆ {cps[0].text}</Text>{dim(` · ${ago(cps[0].at)}`)}</Text>);
+        else lines.push(<Text backgroundColor={bg}>{mark}{"    "}{dim("no milestones yet")}</Text>);
+        for (const c of cps.slice(1, 4)) lines.push(<Text backgroundColor={bg} wrap="truncate-end">{mark}{"      "}{dim(`· ${c.text} · ${ago(c.at)}`)}</Text>);
+        if (tix.length) lines.push(<Text backgroundColor={bg} wrap="truncate-end">{mark}{"    "}{dim("tickets ")}<Text backgroundColor={bg}>{tix.slice(0, 12).map((t) => t.ref).join(" ")}</Text></Text>);
+        if (selected) lines.push(<Text color={TH.muted}>{"     "}{i.owner ? "f flag the chat running it · " : ""}⏎ open its first open ticket</Text>);
+      }
+      if (selected) selLines = [start, lines.length];
+    }
+    const room = bodyH - 2;
+    if (selLines) {
+      const [a, b] = selLines;
+      if (a < ui.tScroll) ui.tScroll = a;
+      else if (b > ui.tScroll + room) ui.tScroll = Math.min(a, b - room);
+    }
+    const top = Math.min(ui.tScroll, Math.max(0, lines.length - room));
+    body = (
+      <Box flexDirection="column" borderStyle="round" borderColor={TH.border} paddingX={1} height={bodyH}>
+        {lines.slice(top, top + room).map((l, i) => <Box key={top + i}>{l}</Box>)}
+      </Box>
+    );
   } else {
     body = (
       <Box height={bodyH}>
@@ -773,7 +1018,7 @@ function App() {
     );
   }
 
-  let footer = BOARD_KEYS;
+  let footer = ui.view === "team" ? TEAM_KEYS : BOARD_KEYS;
   if (ui.detailId && mode !== "board") footer = "Esc back  ↑↓ select  o open screenshot  ⏎ open/reply/expand  r reply  c comment  ⌫ delete comment  a assign  s start  d done  < > move  p priority  x delete item  t theme";
   if (mode === "assign") footer = "↑↓ choose  ⏎ assign  Esc cancel";
   const f = ui.input;
@@ -803,7 +1048,8 @@ function App() {
         <Text color={TH.issue} bold>Delete this comment by {ui.pendingComment.author} for everyone? Replies stay. y / n</Text>
       )}
       {mode === "input" && f && (
-        <InputBox label={f.purpose === "new-title" ? (f.kind === "task" ? "New task:" : "New issue:") : f.label}
+        <InputBox label={f.purpose === "new-title" ? (f.kind === "task" ? "New task:" : "New issue:")
+          : f.purpose === "flag" && f.urgent ? f.label.replace(/:$/, " (urgent):") : f.label}
           value={f.value} hint={f.hint} />
       )}
       <Text wrap="truncate-end" color={ui.flash.startsWith("✗") ? TH.issue : TH.ok}>{ui.flash || " "}</Text>

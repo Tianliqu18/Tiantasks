@@ -16,7 +16,7 @@ const PAGE_BUILD = (() => {
   return (h >>> 0).toString(16);
 })();
 
-const VERSION = "2.8.0";
+const VERSION = "2.8.1";
 const PRIORITIES = ["crit", "high", "med", "low"];
 const PRANK = Object.fromEntries(PRIORITIES.map((p, i) => [p, i]));
 const STATUSES = ["open", "doing", "done"];

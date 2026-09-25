@@ -32,7 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
-VERSION = "2.8.0"
+VERSION = "2.8.1"
 DEFAULT_DB = Path.home() / ".tiantasks" / "tiantasks.db"
 CONFIG = Path.home() / ".tiantasks" / "config.json"
 DEFAULT_PORT = int(os.environ.get("TIANTASKS_PORT", 7777))
