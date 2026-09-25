@@ -425,6 +425,21 @@ class Store {
     return (await this.db.prepare("SELECT * FROM agents ORDER BY principal, name").all()).results;
   }
 
+  async removeAgent(name, user) {
+    const a = await this.db.prepare("SELECT principal FROM agents WHERE name = ?").bind(name).first();
+    if (!a) throw new TTError(`no agent ${name}`, 404);
+    if (a.principal && a.principal !== user) throw new TTError(`${name} works for ${a.principal}; only they can remove it`, 403);
+    await this.db.batch([this.db.prepare("DELETE FROM agents WHERE name = ?").bind(name), this.bump()]);
+    return { ok: true };
+  }
+
+  async removeInitiative(slug, user) {
+    const i = await this.initiative(slug);
+    if (i.principal && i.principal !== user) throw new TTError(`${slug} belongs to ${i.principal}; only they can remove it`, 403);
+    await this.db.batch([this.db.prepare("DELETE FROM initiatives WHERE slug = ?").bind(slug), this.bump()]);
+    return { ok: true };
+  }
+
   async principalOf(name) {
     const r = await this.db.prepare("SELECT principal FROM agents WHERE name = ?").bind(name).first();
     return (r && r.principal) || name;
@@ -730,9 +745,17 @@ async function handle(request, env) {
       if (isAgent && name !== actor && name !== agent) throw new TTError("an agent can only report on itself", 403);
       return json(await store.reportAgent(name, user, await body(request)));
     }
+    if (method === "DELETE" && mg) {
+      if (isAgent) throw new TTError("only a person can remove an agent", 403);
+      return json(await store.removeAgent(decodeURIComponent(mg[1]).toLowerCase(), user));
+    }
     const mi = path.match(/^\/api\/initiatives\/(.+)$/);
     if (method === "GET" && path === "/api/initiatives") return json(await store.initiatives());
     if (method === "GET" && mi) return json(await store.initiative(decodeURIComponent(mi[1])));
+    if (method === "DELETE" && mi) {
+      if (isAgent) throw new TTError("only a person can remove an initiative", 403);
+      return json(await store.removeInitiative(decodeURIComponent(mi[1]), user));
+    }
     if (method === "PUT" && mi) return json(await store.putInitiative(decodeURIComponent(mi[1]), user, await body(request)));
     if (method === "GET" && path === "/api/checkpoints") {
       return json(await store.checkpoints({ ref: q.get("ref"), initiative: q.get("initiative"), limit: q.get("limit") }));

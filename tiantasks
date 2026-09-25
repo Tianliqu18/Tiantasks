@@ -603,6 +603,24 @@ class Store:
     def agents(self):
         return [dict(r) for r in self.db.execute("SELECT * FROM agents ORDER BY principal, name")]
 
+    def remove_agent(self, name, user):
+        with self.tx():
+            a = self.agent(name)
+            if a["principal"] and a["principal"] != user:
+                raise TTError(f"{name} works for {a['principal']}; only they can remove it", 403)
+            self.db.execute("DELETE FROM agents WHERE name=?", (name,))
+            self._bump()
+        return {"ok": True}
+
+    def remove_initiative(self, slug, user):
+        with self.tx():
+            i = self.initiative(slug)
+            if i["principal"] and i["principal"] != user:
+                raise TTError(f"{slug} belongs to {i['principal']}; only they can remove it", 403)
+            self.db.execute("DELETE FROM initiatives WHERE slug=?", (slug,))
+            self._bump()
+        return {"ok": True}
+
     def principal_of(self, name):
         """Who an agent works for; a person is their own principal."""
         r = self.db.execute("SELECT principal FROM agents WHERE name=?", (name,)).fetchone()
@@ -1701,11 +1719,19 @@ def make_handler(db_path, me, users=None):
                 if is_agent and name not in (actor, self.agent_header):
                     raise TTError("an agent can only report on itself", 403)
                 return self._send(200, store.report_agent(name, user, self._body()))
+            if method == "DELETE" and mg:
+                if is_agent:
+                    raise TTError("only a person can remove an agent", 403)
+                return self._send(200, store.remove_agent(unquote(mg.group(1)).lower(), user))
             mi = re.fullmatch(r"/api/initiatives/(.+)", path)
             if method == "GET" and path == "/api/initiatives":
                 return self._send(200, store.initiatives())
             if method == "GET" and mi:
                 return self._send(200, store.initiative(unquote(mi.group(1))))
+            if method == "DELETE" and mi:
+                if is_agent:
+                    raise TTError("only a person can remove an initiative", 403)
+                return self._send(200, store.remove_initiative(unquote(mi.group(1)), user))
             if method == "PUT" and mi:
                 return self._send(200, store.put_initiative(unquote(mi.group(1)), user, self._body()))
             if method == "GET" and path == "/api/checkpoints":
@@ -2103,6 +2129,7 @@ DELETE /api/attachments/ID
 
 GET    /api/agents                      [{name, principal, kind, host, project, initiative, state, doing, last_seen}]
 PUT    /api/agents/NAME                 {kind, host, project, initiative, state: working|idle|waiting|offline, doing}
+DELETE /api/agents/NAME                 its person only (DELETE /api/initiatives/SLUG likewise)
 GET    /api/initiatives                 [{slug, project, title, summary, status, owner, principal}]
 PUT    /api/initiatives/PROJECT/NAME    {title, project, summary, status: active|paused|done, owner}
 GET    /api/checkpoints?ref=&initiative=
