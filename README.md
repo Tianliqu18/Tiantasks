@@ -56,6 +56,8 @@ nothing needs configuring.
 - **Directives:** `--directive "their exact words"` on any write records that a person asked for
   it; an adapter can check the quote against the agent's conversation.
 - **Custom fields:** `tt edit ID --field preview=https://…` or `--initiative app/billing`.
+- **Cleanup:** a person can remove their own agents and initiatives (`DELETE /api/agents/NAME`,
+  `DELETE /api/initiatives/SLUG`); an adapter does this when something goes out of scope.
 
 Delivering flags into chats, reporting agent status and posting automatic milestones is the job
 of a small adapter for your own setup; it only uses the HTTP API above (`/llms.txt`).
