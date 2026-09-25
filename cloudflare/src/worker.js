@@ -7,6 +7,7 @@ import LOGIN_PAGE from "./login.html";
 import CLI from "./tiantasks.txt";
 import BOARD_APP from "./board.mjs.txt";
 import AGENT_GUIDE from "./llms.txt";
+import SCHEMA from "./schema.txt";
 
 // Open pages compare this to what they loaded with and reload onto a new release.
 const PAGE_BUILD = (() => {
@@ -855,9 +856,20 @@ async function handle(request, env) {
   }
 }
 
+// New tables appear on their own: every statement is CREATE ... IF NOT EXISTS, run once per
+// Worker instance, so a deploy never needs a separate database step (or D1 permissions).
+let schemaReady = null;
+function ensureSchema(db) {
+  const sql = SCHEMA.split("\n").filter((l) => !l.trim().startsWith("--")).join("\n"); // comments first: they can contain ";"
+  schemaReady ??= db.batch(sql.split(";").map((s) => s.trim()).filter(Boolean).map((s) => db.prepare(s)))
+    .catch((e) => { schemaReady = null; throw e; });
+  return schemaReady;
+}
+
 export default {
   async fetch(request, env) {
     try {
+      if (env.DB) await ensureSchema(env.DB);
       return await handle(request, env);
     } catch (e) {
       if (e instanceof TTError) return json({ error: e.message }, e.status);

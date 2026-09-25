@@ -9,6 +9,7 @@ open("src/page.html", "w").write(g["PAGE"])
 open("src/login.html", "w").write(g["LOGIN_PAGE"])
 open("schema.sql", "w").write(g["SCHEMA"].strip() + "\n" + g["LEGACY_COMMENTS_SQL"].strip() + "\n")
 open("src/llms.txt", "w").write(g["AGENT_GUIDE"])
+open("src/schema.txt", "w").write(g["SCHEMA"])  # the Worker creates missing tables itself on start
 worker = open("src/worker.js").read()
 if f'const VERSION = "{g["VERSION"]}";' not in worker:
     raise SystemExit(f"src/worker.js VERSION doesn't match tiantasks ({g['VERSION']}); bump both")
